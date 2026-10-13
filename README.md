@@ -77,3 +77,7 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
 - `~/.config/isardvdi-cli/isard-vpn.conf` holds a WireGuard **private key**; `token` is a cached JWT;
   `browser-profile/` is a saved login. All are created mode 600/700 — treat them as secrets.
 - Do not store desktop passwords in the IsardVDI portal (descriptions and credentials are plain text).
+
+## License
+
+[MIT](LICENSE)
