@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# isardvdi - CLI for managing IsardVDI virtual desktops via the REST API.
+
+set -eu -o pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/isardvdi-cli"
+CONF_FILE="$CONF_DIR/config"
+PROFILE_DIR="$CONF_DIR/browser-profile"
+HELPER="${ISARDVDI_SSO_HELPER:-${XDG_DATA_HOME:-$HOME/.local/share}/isardvdi-cli/sso_login.py}"
+TOKEN_FILE="$CONF_DIR/token"
+VPN_FILE="$CONF_DIR/isard-vpn.conf"
+TOKEN_MAX_AGE=$((25 * 60))
+START_TIMEOUT="${ISARDVDI_START_TIMEOUT:-180}"
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+err() { printf '%s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+require curl
+require jq
+require python3
+
+load_config() {
+    [[ -f "$CONF_FILE" ]] || die "No config found. Run: isardvdi init"
+    # shellcheck disable=SC1090
+    . "$CONF_FILE"
+    [[ -n "${URL:-}" ]] || die "Config $CONF_FILE missing URL. Run: isardvdi init"
+}
+
+sso_login() {
+    # Stdout: raw JWT. Pass --visible for an interactive browser sign-in.
+    python3 "$HELPER" --url "$URL" --profile "$PROFILE_DIR" --user "${USERNAME:-}" "$@"
+}
+
+do_login() {
+    # Stdout: raw JWT. Corporate login is SAML (Microsoft): first try a silent refresh through the
+    # saved browser profile; if Microsoft wants the password again, open the browser (terminal only).
+    local jwt rc=0
+    jwt=$(sso_login) || rc=$?
+    if [[ $rc -eq 4 ]]; then
+        rc=0; jwt=$(sso_login) || rc=$?   # one silent retry: a stale browser lock/redirect can fail once
+    fi
+    if [[ $rc -eq 4 ]]; then
+        if [[ -t 0 && -t 2 ]]; then
+            err "Silent sign-in not possible; opening the browser..."
+            jwt=$(sso_login --visible) || return 1
+        else
+            err "Sign-in expired. Run: isardvdi login"
+            return 1
+        fi
+    elif [[ $rc -ne 0 ]]; then
+        err "Login failed (helper exit $rc)."
+        return 1
+    fi
+    printf '%s' "$jwt"
+}
+
+token_age_seconds() {
+    local now mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$TOKEN_FILE" 2>/dev/null || echo 0)
+    echo $((now - mtime))
+}
+
+get_jwt() {
+    load_config
+    if [[ -f "$TOKEN_FILE" ]] && [[ $(token_age_seconds) -lt $TOKEN_MAX_AGE ]]; then
+        cat "$TOKEN_FILE"
+        return
+    fi
+    local jwt
+    jwt=$(do_login) || exit 1
+    ( umask 077; printf '%s' "$jwt" > "$TOKEN_FILE" )
+    printf '%s' "$jwt"
+}
+
+api_call() {
+    # api_call METHOD PATH. Auto-retries once on HTTP 401: IsardVDI can invalidate the JWT
+    # server-side before our local 25 min cache expires (e.g. on web-session timeout).
+    load_config
+    local method="$1" path="$2" resp status body attempt jwt
+    for attempt in 1 2; do
+        jwt=$(get_jwt) || return 1
+        resp=$(curl -sS -X "$method" -w '\n%{http_code}' \
+            -H "Authorization: Bearer $jwt" \
+            "$URL$path")
+        status="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+        if [[ "$status" == "401" && $attempt -eq 1 ]]; then
+            err "JWT rejected — refreshing and retrying..."
+            rm -f "$TOKEN_FILE"
+            continue
+        fi
+        break
+    done
+    if [[ "$status" != 2* ]]; then
+        err "HTTP $status on $method $path: $body"
+        return 1
+    fi
+    printf '%s' "$body"
+}
+api_get() { api_call GET "$1"; }
+
+list_desktops_json() { api_get "/api/v4/items/desktops" | jq '.desktops'; }
+desktop_detail_json() { api_get "/api/v4/item/desktop/$1/get-info"; }
+# The list endpoint matches the web UI and reports status/ip reliably during transitions.
+# Use this for status+ip lookups (start/ssh polling).
+desktop_from_list() { list_desktops_json | jq --arg id "$1" '.[] | select(.id == $id)'; }
+
+find_desktop() {
+    local query="$1"
+    if [[ "$query" =~ $UUID_RE ]]; then
+        printf '%s' "$query"
+        return
+    fi
+    local json matches count
+    json=$(list_desktops_json)
+    matches=$(printf '%s' "$json" | jq -r --arg q "$query" '
+        .[]
+        | select(.name | ascii_downcase | contains($q | ascii_downcase))
+        | [.id, .name] | @tsv')
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    if [[ "$count" == "0" ]]; then
+        die "No desktop matches \"$query\""
+    elif [[ "$count" != "1" ]]; then
+        err "Multiple desktops match \"$query\":"
+        printf '%s\n' "$matches" >&2
+        die "Be more specific (try the full name or the id)."
+    fi
+    printf '%s' "$matches" | cut -f1
+}
+
+vpn_iface() { basename "$VPN_FILE" .conf; }
+vpn_iface_up() { ip link show "$(vpn_iface)" >/dev/null 2>&1; }
+
+wait_started() {
+    # $1=id, $2=timeout-seconds. Prints IP to stdout when ready, exits 1 on timeout.
+    # Prints a heartbeat to stderr every 10 s so the user knows it's still alive.
+    local id="$1" timeout="${2:-60}" elapsed=0 d state ip last_state=""
+    while [[ $elapsed -lt $timeout ]]; do
+        d=$(desktop_from_list "$id")
+        state=$(printf '%s' "$d" | jq -r '.status')
+        ip=$(printf '%s' "$d" | jq -r '.ip // "null"')
+        if [[ "$state" == "Started" && "$ip" != "null" ]]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+        if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
+            printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$state" "$ip" >&2
+            last_state="$state"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+cmd_init() {
+    local url username ssh_user jwt
+    read -rp "IsardVDI URL [https://elmeuescriptori.gestioeducativa.gencat.cat]: " url
+    url="${url:-https://elmeuescriptori.gestioeducativa.gencat.cat}"
+    read -rp "Corporate account (email, used to pick it at Microsoft) []: " username
+    read -rp "Default SSH user on desktops [isard]: " ssh_user
+    ssh_user="${ssh_user:-isard}"
+
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$CONF_DIR"
+    (
+        umask 077
+        {
+            printf 'URL=%q\n' "$url"
+            printf 'USERNAME=%q\n' "$username"
+            printf 'SSH_USER=%q\n' "$ssh_user"
+        } > "$CONF_FILE"
+    )
+    echo "A browser window will open: sign in with your corporate account."
+    echo "Accept 'Stay signed in' so later logins are silent. Do not close the window."
+    rm -f "$TOKEN_FILE"
+    URL="$url"; USERNAME="$username"
+    jwt=$(sso_login --visible) \
+        || die "Login failed; config kept at $CONF_FILE, retry with: isardvdi login"
+    ( umask 077; printf '%s' "$jwt" > "$TOKEN_FILE" )
+    echo "OK. Config saved to $CONF_FILE (no password is stored)."
+}
+
+cmd_login() {
+    # Interactive sign-in in a visible browser (use when the silent refresh stopped working).
+    load_config
+    rm -f "$TOKEN_FILE"
+    local jwt
+    jwt=$(sso_login --visible) || exit 1
+    ( umask 077; printf '%s' "$jwt" > "$TOKEN_FILE" )
+    echo "Logged in."
+}
+
+cmd_list() {
+    list_desktops_json | jq -r '
+        (["NAME","STATE","IP","ID"]),
+        (.[] | [.name, .status, (.ip // "-"), .id])
+        | @tsv' | column -t -s$'\t'
+}
+
+cmd_status() {
+    [[ $# -ge 1 ]] || die "Usage: isardvdi status <name|id>"
+    local id
+    id=$(find_desktop "$1")
+    desktop_detail_json "$id" | jq '{name, status, ip, interfaces}'
+}
+
+cmd_start() {
+    [[ $# -ge 1 ]] || die "Usage: isardvdi start <name|id>"
+    local id ip
+    id=$(find_desktop "$1")
+    api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
+    echo "Start requested for $id; waiting up to ${START_TIMEOUT} s ..."
+    if ip=$(wait_started "$id" "$START_TIMEOUT"); then
+        echo "Started: ip=$ip"
+    else
+        die "Timed out after ${START_TIMEOUT} s. Check 'isardvdi status' or set ISARDVDI_START_TIMEOUT=300."
+    fi
+}
+
+cmd_stop() {
+    local force=0
+    if [[ "${1:-}" == "--force" ]]; then force=1; shift; fi
+    [[ $# -ge 1 ]] || die "Usage: isardvdi stop [--force] <name|id>"
+    local id
+    id=$(find_desktop "$1")
+    api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null
+    echo "Stop requested for $id"
+    if [[ $force -eq 1 ]]; then
+        sleep 0.5
+        api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null || true
+        echo "Force-stop re-issued"
+    fi
+}
+
+cmd_ssh() {
+    local no_start=0 user="" target="" args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-start) no_start=1; shift ;;
+            -l) [[ $# -ge 2 ]] || die "-l needs a username"; user="$2"; shift 2 ;;
+            --) shift; args=("$@"); break ;;
+            -*) die "Unknown flag: $1" ;;
+            *) if [[ -z "$target" ]]; then target="$1"; shift; else args+=("$1"); shift; fi ;;
+        esac
+    done
+    [[ -n "$target" ]] || die "Usage: isardvdi ssh <name|id> [-l user] [--no-start] [-- ssh-args...]"
+
+    local id d state ip
+    id=$(find_desktop "$target")
+    d=$(desktop_from_list "$id")
+    state=$(printf '%s' "$d" | jq -r '.status')
+    ip=$(printf '%s' "$d" | jq -r '.ip // "null"')
+
+    if [[ "$state" != "Started" || "$ip" == "null" ]]; then
+        if [[ $no_start -eq 1 ]]; then
+            die "Desktop not Started (state=$state). --no-start requested, refusing to start."
+        fi
+        case "$state" in
+            Stopped|Failed)
+                echo "Desktop is $state — starting it..." >&2
+                api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
+                ;;
+            *)
+                echo "Desktop is $state — waiting for it to come up..." >&2
+                ;;
+        esac
+        if ! ip=$(wait_started "$id" "$START_TIMEOUT"); then
+            die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started with an IP"
+        fi
+    fi
+
+    if ! timeout 2 bash -c "</dev/tcp/$ip/22" 2>/dev/null; then
+        if vpn_iface_up; then
+            die "Cannot reach $ip:22 — '$(vpn_iface)' interface is up locally, but the tunnel looks stale.
+IsardVDI invalidates the WireGuard peer when the web session expires. Refresh it:
+    isardvdi vpn-reload"
+        else
+            die "Cannot reach $ip:22 — the IsardVDI WireGuard VPN is not up.
+Run: sudo wg-quick up $VPN_FILE"
+        fi
+    fi
+
+    local ssh_user="${user:-${SSH_USER:-isard}}"
+    echo "Connecting to $ssh_user@$ip ..." >&2
+    # DISPLAY="" forces ssh to prompt at the terminal instead of via a GUI
+    # askpass helper, which on some desktops never surfaces and makes ssh look hung.
+    DISPLAY="" exec ssh "$ssh_user@$ip" "${args[@]}"
+}
+
+_vpn_fetch() {
+    # _vpn_fetch [reset]. Fetch the VPN config and write it to $VPN_FILE.
+    # With "reset" the server rotates the WireGuard peer key first (PUT reset-vpn).
+    local content
+    if [[ "${1:-}" == "reset" ]]; then
+        api_call PUT "/api/v4/item/user/reset-vpn" >/dev/null
+    fi
+    content=$(api_get "/api/v4/item/user/get-vpn")
+    [[ "$content" == *"[Interface]"* ]] || die "Unexpected VPN config from server"
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$CONF_DIR"
+    ( umask 077; printf '%s\n' "$content" > "$VPN_FILE" )
+}
+
+cmd_vpn_config() {
+    if ! command -v wg-quick >/dev/null 2>&1; then
+        die "wg-quick not found. Install with: sudo apt install wireguard"
+    fi
+    _vpn_fetch
+    echo "Wrote $VPN_FILE"
+    if vpn_iface_up; then
+        echo "Interface '$(vpn_iface)' is already up — restart it if the config changed:"
+        echo "    sudo wg-quick down $VPN_FILE && sudo wg-quick up $VPN_FILE"
+        echo "(Or just run: isardvdi vpn-reload)"
+    else
+        echo "To bring the tunnel up:   sudo wg-quick up $VPN_FILE"
+        echo "To bring the tunnel down: sudo wg-quick down $VPN_FILE"
+    fi
+}
+
+cmd_vpn_reload() {
+    # Rotate the VPN keys server-side, re-fetch the config and bounce the tunnel.
+    # Needs sudo for wg-quick. sudo caches credentials so this is one password prompt.
+    if ! command -v wg-quick >/dev/null 2>&1; then
+        die "wg-quick not found. Install with: sudo apt install wireguard"
+    fi
+    _vpn_fetch reset
+    echo "Refreshed $VPN_FILE"
+    if vpn_iface_up; then
+        echo "Bouncing tunnel '$(vpn_iface)' (sudo may prompt)..."
+        sudo wg-quick down "$VPN_FILE"
+    else
+        echo "Bringing tunnel '$(vpn_iface)' up (sudo may prompt)..."
+    fi
+    sudo wg-quick up "$VPN_FILE"
+    echo "OK. Tunnel '$(vpn_iface)' is up with fresh keys."
+}
+
+cmd_help() {
+    cat <<EOF
+isardvdi - CLI for managing IsardVDI virtual desktops via the REST API
+
+USAGE
+    isardvdi <command> [arguments]
+
+COMMANDS
+    init                            Interactive setup: URL, corporate account, default SSH
+                                    user. Opens a browser for the SAML (Microsoft) sign-in.
+                                    No password is stored.
+    login                           Interactive browser sign-in (when the silent refresh
+                                    stops working, e.g. Microsoft asks for the password).
+    list                            List your desktops (name, state, IP, id).
+    status <name|id>                Show one desktop's details as JSON.
+    start  <name|id>                Start a desktop and wait until it reaches state
+                                    "Started" with an IP. See ISARDVDI_START_TIMEOUT.
+    stop   [--force] <name|id>      Stop a desktop. --force re-issues stop after 0.5 s.
+    ssh    <name|id> [-l USER] [--no-start] [-- SSH-ARGS...]
+                                    SSH into a (running) desktop. If it isn't
+                                    running, it's auto-started first (suppress with
+                                    --no-start). SSH user resolution order:
+                                      1. -l flag
+                                      2. SSH_USER from config / environment
+                                      3. fallback "isard"
+                                    Anything after -- is forwarded to ssh.
+    vpn-config                      Download the IsardVDI WireGuard config to
+                                    ~/.config/isardvdi-cli/isard-vpn.conf and print
+                                    the sudo command to bring it up.
+    vpn-reload                      Rotate keys server-side, refresh the config
+                                    and bounce the tunnel in one step. Needs sudo.
+    help, -h, --help                This help.
+
+DESKTOP NAME MATCHING
+    A <name|id> argument is matched as either an exact UUID, or a case-insensitive
+    substring of the desktop name. "hermes" matches "hermes DAW2 server".
+    If a substring matches more than one desktop, the candidates are listed and
+    the command exits 1.
+
+ENVIRONMENT
+    ISARDVDI_PASSWORD        Optional: auto-fills the Microsoft password for ONE login run
+                             (never stored). Leave unset to type it in the browser.
+    ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to reach Started state
+                             during 'start' and 'ssh'. Default: 180.
+    SSH_USER                 Default username for 'isardvdi ssh'. Overrides the
+                             "isard" fallback and is itself overridden by '-l USER'.
+                             Read from the config file by default.
+
+FILES
+    $CONF_FILE
+        URL, USERNAME (account hint), SSH_USER. Mode 600.
+    $PROFILE_DIR
+        Browser profile holding the Microsoft single sign-on, so the JWT refreshes
+        without a password. Treat it like a saved login; delete it to sign out.
+    $TOKEN_FILE
+        Cached JWT, auto-refreshed (TTL 30 min, refreshed at 25 min, plus
+        transparent retry on HTTP 401). Refresh = silent headless SAML login.
+    $VPN_FILE
+        WireGuard config (\`Address\`, \`PrivateKey\`, peer info). Mode 600.
+        This file contains a private key — treat it as a secret.
+
+EXAMPLES
+    isardvdi init
+    isardvdi list
+    isardvdi start hermes
+    isardvdi ssh hermes
+    isardvdi ssh hermes -l ubuntu -- -p 2222
+    ISARDVDI_START_TIMEOUT=300 isardvdi ssh hermes
+    isardvdi vpn-reload
+
+EXIT STATUS
+    0  Success.
+    1  Any error (no match, bad credentials, server error, timeout, ...).
+
+SEE ALSO
+    isardvdi(1), wg-quick(8), ssh(1)
+EOF
+}
+
+cmd="${1:-help}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$cmd" in
+    init)            cmd_init "$@" ;;
+    login)           cmd_login "$@" ;;
+    list|ls)         cmd_list "$@" ;;
+    status)          cmd_status "$@" ;;
+    start)           cmd_start "$@" ;;
+    stop)            cmd_stop "$@" ;;
+    ssh)             cmd_ssh "$@" ;;
+    vpn-config|vpn)  cmd_vpn_config "$@" ;;
+    vpn-reload|vpn-restart) cmd_vpn_reload "$@" ;;
+    help|-h|--help)  cmd_help ;;
+    *) err "Unknown command: $cmd"; cmd_help; exit 1 ;;
+esac
