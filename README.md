@@ -19,7 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.
 ```
 
 Requirements: `curl`, `jq`, `python3`, `ssh`, Python `playwright` (+ Chromium), and `wireguard-tools`
-if you want to reach desktops over the VPN.
+if you want to reach desktops over the VPN. For `console`: `virt-viewer` (SPICE, the default) and,
+for `--rdp`, `freerdp3-x11` (or Remmina).
 
 Pin a version with `ISARDVDI_REF=<tag-or-commit>`; change locations with `BIN_DIR` / `DATA_DIR`.
 
@@ -33,6 +34,19 @@ isardvdi list      # your desktops: name, state, IP, id
 No password is stored. The browser profile in `~/.config/isardvdi-cli/browser-profile` keeps the
 Microsoft SSO so later token refreshes are silent; when Microsoft asks again, run `isardvdi login`.
 
+### Stay logged in on the web: API key
+
+IsardVDI allows **one login session per user**: every time the CLI signs in, your web browser is
+logged out (and vice versa). Teachers and other `advanced` users can avoid this with an API key,
+which has no session:
+
+```sh
+isardvdi apikey create            # one last SAML login; key valid 365 days (--days N for less)
+isardvdi apikey status
+```
+
+From then on the CLI only uses the key. When it expires, run `apikey create` again.
+
 ## Commands
 
 | Command | What it does |
@@ -44,6 +58,10 @@ Microsoft SSO so later token refreshes are silent; when Microsoft asks again, ru
 | `ssh <name\|id> [-l user] [--no-start] [-- ssh-args]` | Auto-start if needed, then SSH in |
 | `vpn-config` | Download the WireGuard config, print the `wg-quick` command |
 | `vpn-reload` | Rotate keys and bounce the tunnel (**breaks a working tunnel if misused**) |
+| `deployments` | Deployments you own or co-own |
+| `students <deployment>` | A deployment's desktops: student, group, state, IP, id |
+| `console <desktop>` / `console <deployment> <student> [--browser\|--rdp]` | Auto-start if needed, then open the console (SPICE by default) |
+| `apikey create [--days N]` / `status` / `revoke` | Use an API key instead of SAML logins (see below) |
 
 `<name|id>` is an exact UUID or a case-insensitive substring of the desktop name.
 See `isardvdi help` for environment variables (`ISARDVDI_START_TIMEOUT`, `SSH_USER`, ...).
@@ -75,7 +93,11 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
 ## Files and security
 
 - `~/.config/isardvdi-cli/isard-vpn.conf` holds a WireGuard **private key**; `token` is a cached JWT;
-  `browser-profile/` is a saved login. All are created mode 600/700 — treat them as secrets.
+  `browser-profile/` is a saved login; `apikey` acts as you for up to a year. All are created
+  mode 600/700 — treat them as secrets.
+- IsardVDI does not check API keys against its stored record, so `isardvdi apikey revoke` only
+  deletes the local file and that record: a leaked copy keeps working until it expires. Prefer
+  a shorter `--days` on shared machines.
 - Do not store desktop passwords in the IsardVDI portal (descriptions and credentials are plain text).
 
 ## License

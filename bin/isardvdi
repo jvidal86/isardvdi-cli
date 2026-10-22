@@ -9,6 +9,7 @@ CONF_FILE="$CONF_DIR/config"
 PROFILE_DIR="$CONF_DIR/browser-profile"
 HELPER="${ISARDVDI_SSO_HELPER:-${XDG_DATA_HOME:-$HOME/.local/share}/isardvdi-cli/sso_login.py}"
 TOKEN_FILE="$CONF_DIR/token"
+APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
 TOKEN_MAX_AGE=$((25 * 60))
 START_TIMEOUT="${ISARDVDI_START_TIMEOUT:-180}"
@@ -64,8 +65,31 @@ token_age_seconds() {
     echo $((now - mtime))
 }
 
+jwt_exp() {
+    # Stdout: the "exp" claim (epoch seconds) of a JWT, or nothing if it can't be decoded.
+    local p
+    p=$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')
+    case $((${#p} % 4)) in 2) p="$p==" ;; 3) p="$p=" ;; esac
+    printf '%s' "$p" | base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null || true
+}
+
+# An API key has its own pseudo-session ("api-key"), so using it never creates or revokes a
+# login session. Login sessions are one per user: every SAML login logs out the web browser.
+# _ISARDVDI_LOGIN_TOKEN=1 forces the login token (needed to create an API key).
+using_apikey() { [[ -z "${_ISARDVDI_LOGIN_TOKEN:-}" && -f "$APIKEY_FILE" ]]; }
+
 get_jwt() {
     load_config
+    if using_apikey; then
+        local key exp
+        key=$(cat "$APIKEY_FILE")
+        exp=$(jwt_exp "$key")
+        if [[ -n "$exp" && "$exp" -le $(date +%s) ]]; then
+            die "API key expired on $(date -d "@$exp" '+%F %R'). Run: isardvdi apikey create"
+        fi
+        printf '%s' "$key"
+        return
+    fi
     if [[ -f "$TOKEN_FILE" ]] && [[ $(token_age_seconds) -lt $TOKEN_MAX_AGE ]]; then
         cat "$TOKEN_FILE"
         return
@@ -77,17 +101,24 @@ get_jwt() {
 }
 
 api_call() {
-    # api_call METHOD PATH. Auto-retries once on HTTP 401: IsardVDI can invalidate the JWT
-    # server-side before our local 25 min cache expires (e.g. on web-session timeout).
+    # api_call METHOD PATH [JSON-BODY]. With a login token, auto-retries once on HTTP 401:
+    # IsardVDI revokes the session when the same user logs in elsewhere (e.g. the web browser).
     load_config
-    local method="$1" path="$2" resp status body attempt jwt
+    local method="$1" path="$2" data="${3:-}" resp status body attempt jwt
+    local body_args=()
+    [[ -n "$data" ]] && body_args=(-H "Content-Type: application/json" --data "$data")
     for attempt in 1 2; do
         jwt=$(get_jwt) || return 1
         resp=$(curl -sS -X "$method" -w '\n%{http_code}' \
             -H "Authorization: Bearer $jwt" \
+            "${body_args[@]}" \
             "$URL$path")
         status="${resp##*$'\n'}"
         body="${resp%$'\n'*}"
+        if [[ "$status" == "401" ]] && using_apikey; then
+            # Don't fall back to a SAML login: that would log the web browser out.
+            die "API key rejected (HTTP 401). Create a new one with: isardvdi apikey create"
+        fi
         if [[ "$status" == "401" && $attempt -eq 1 ]]; then
             err "JWT rejected — refreshing and retrying..."
             rm -f "$TOKEN_FILE"
@@ -109,27 +140,45 @@ desktop_detail_json() { api_get "/api/v4/item/desktop/$1/get-info"; }
 # Use this for status+ip lookups (start/ssh polling).
 desktop_from_list() { list_desktops_json | jq --arg id "$1" '.[] | select(.id == $id)'; }
 
+list_deployments_json() { api_get "/api/v4/items/deployments" | jq '.deployments // .'; }
+# The videowall endpoint returns every desktop of a deployment (with its student) in one call.
+deployment_desktops_json() { api_get "/api/v4/item/deployment/$1/videowall" | jq '.desktops // []'; }
+
+match_one() {
+    # match_one WHAT QUERY FIELD < JSON-ARRAY. Stdout: the id of the single element whose FIELD
+    # contains QUERY (case-insensitive); dies listing the candidates if there are none or several.
+    local what="$1" query="$2" field="$3" matches count
+    matches=$(jq -r --arg q "$query" --arg f "$field" '
+        .[]
+        | select(.[$f] // "" | ascii_downcase | contains($q | ascii_downcase))
+        | [.id, .[$f]] | @tsv')
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    if [[ "$count" == "0" ]]; then
+        die "No $what matches \"$query\""
+    elif [[ "$count" != "1" ]]; then
+        err "Multiple ${what}s match \"$query\":"
+        printf '%s\n' "$matches" >&2
+        die "Be more specific (try the full name or the id)."
+    fi
+    printf '%s' "$matches" | cut -f1
+}
+
 find_desktop() {
     local query="$1"
     if [[ "$query" =~ $UUID_RE ]]; then
         printf '%s' "$query"
         return
     fi
-    local json matches count
-    json=$(list_desktops_json)
-    matches=$(printf '%s' "$json" | jq -r --arg q "$query" '
-        .[]
-        | select(.name | ascii_downcase | contains($q | ascii_downcase))
-        | [.id, .name] | @tsv')
-    count=$(printf '%s' "$matches" | grep -c . || true)
-    if [[ "$count" == "0" ]]; then
-        die "No desktop matches \"$query\""
-    elif [[ "$count" != "1" ]]; then
-        err "Multiple desktops match \"$query\":"
-        printf '%s\n' "$matches" >&2
-        die "Be more specific (try the full name or the id)."
+    list_desktops_json | match_one desktop "$query" name
+}
+
+find_deployment() {
+    local query="$1"
+    if [[ "$query" =~ $UUID_RE ]]; then
+        printf '%s' "$query"
+        return
     fi
-    printf '%s' "$matches" | cut -f1
+    list_deployments_json | match_one deployment "$query" name
 }
 
 vpn_iface() { basename "$VPN_FILE" .conf; }
@@ -149,6 +198,23 @@ wait_started() {
         fi
         if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
             printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$state" "$ip" >&2
+            last_state="$state"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+wait_state_started() {
+    # $1=id, $2=timeout-seconds. Like wait_started, but only waits for state "Started" (no IP
+    # needed) and uses get-info, which also works for students' desktops in your deployments.
+    local id="$1" timeout="${2:-60}" elapsed=0 state last_state=""
+    while [[ $elapsed -lt $timeout ]]; do
+        state=$(desktop_detail_json "$id" | jq -r '.status')
+        [[ "$state" == "Started" ]] && return 0
+        if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
+            printf '  [%3ds/%ds] state=%s\n' "$elapsed" "$timeout" "$state" >&2
             last_state="$state"
         fi
         sleep 1
@@ -340,6 +406,193 @@ cmd_vpn_reload() {
     echo "OK. Tunnel '$(vpn_iface)' is up with fresh keys."
 }
 
+cmd_deployments() {
+    list_deployments_json | jq -r '
+        (["NAME","USERS","DESKTOPS","STARTED","ROLE","ID"]),
+        (.[] | [.name, .total_users, .total_desktops, .started_desktops,
+                (if .co_owner then "co-owner" else "owner" end), .id])
+        | @tsv' | column -t -s$'\t'
+}
+
+cmd_students() {
+    [[ $# -ge 1 ]] || die "Usage: isardvdi students <deployment>"
+    local dep
+    dep=$(find_deployment "$1")
+    deployment_desktops_json "$dep" | jq -r '
+        (["STUDENT","GROUP","STATE","IP","DESKTOP ID"]),
+        (sort_by(.user_name | ascii_downcase) | .[]
+         | [.user_name, .group_name, .status, (.ip // "-"), .id])
+        | @tsv' | column -t -s$'\t'
+}
+
+cmd_console() {
+    local no_start=0 viewer_type="file-spice" pos=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-start) no_start=1 ;;
+            --browser)  viewer_type="browser-vnc" ;;
+            --rdp)      viewer_type="file-rdpgw" ;;
+            -*) die "Unknown flag: $1" ;;
+            *) pos+=("$1") ;;
+        esac
+        shift
+    done
+
+    local id
+    case ${#pos[@]} in
+        1) id=$(find_desktop "${pos[0]}") ;;
+        2) local dep
+           dep=$(find_deployment "${pos[0]}")
+           id=$(deployment_desktops_json "$dep" | match_one "student desktop" "${pos[1]}" user_name) ;;
+        *) die "Usage: isardvdi console <desktop> | <deployment> <student> [--browser|--rdp] [--no-start]" ;;
+    esac
+
+    local state
+    state=$(desktop_detail_json "$id" | jq -r '.status')
+    if [[ "$state" != "Started" ]]; then
+        [[ $no_start -eq 0 ]] || die "Desktop not Started (state=$state). --no-start requested, refusing to start."
+        case "$state" in
+            Stopped|Failed)
+                echo "Desktop is $state — starting it..." >&2
+                api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
+                ;;
+            *) echo "Desktop is $state — waiting for it to come up..." >&2 ;;
+        esac
+        wait_state_started "$id" "$START_TIMEOUT" \
+            || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started"
+    fi
+
+    if [[ "$viewer_type" == "file-rdpgw" ]]; then
+        # The RDP gateway connects to the guest's IP, which only exists on the WireGuard interface
+        # and only once the guest OS has booted and taken its address.
+        local info elapsed=0
+        info=$(desktop_detail_json "$id")
+        printf '%s' "$info" | jq -e '.interfaces // [] | any(.id == "wireguard")' >/dev/null \
+            || die "This desktop has no WireGuard interface, which RDP needs. Add 'Wireguard VPN' to its
+networks in the web UI (desktop → Edit → Hardware), or use the SPICE console (without --rdp)."
+        while [[ $(printf '%s' "$info" | jq -r '.ip // ""') == "" ]]; do
+            (( elapsed < START_TIMEOUT )) \
+                || die "Timed out after ${START_TIMEOUT} s waiting for the guest IP (is the guest OS up?)"
+            (( elapsed % 10 == 0 )) && printf '  [%3ds/%ds] waiting for the guest IP...\n' "$elapsed" "$START_TIMEOUT" >&2
+            sleep 2
+            elapsed=$((elapsed + 2))
+            info=$(desktop_detail_json "$id")
+        done
+    fi
+
+    # Right after a start the viewer data can lag a few seconds behind the state.
+    local viewer attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if [[ $attempt -lt 10 ]]; then
+            viewer=$(api_get "/api/v4/item/desktop/$id/get-viewer/$viewer_type" 2>/dev/null) && break
+            sleep 2
+        else
+            viewer=$(api_get "/api/v4/item/desktop/$id/get-viewer/$viewer_type") || exit 1
+        fi
+    done
+
+    if [[ $(printf '%s' "$viewer" | jq -r '.kind') == "browser" ]]; then
+        # noVNC accepts the viewer data as ?cookie=; the websocket still authenticates with the
+        # browser's own IsardVDI session cookie, so you must be logged in to the portal there.
+        local url
+        url=$(printf '%s' "$viewer" | jq -r '
+            if (.viewer | test("[?&]cookie=")) then .viewer
+            else .viewer + "?cookie=" + (.cookie | @uri) end')
+        echo "Opening the browser viewer (you must be logged in to $URL in that browser)..." >&2
+        xdg-open "$url" >/dev/null 2>&1 &
+        return
+    fi
+
+    # File viewers: the file holds connection secrets (SPICE password; RDP gateway token and the
+    # guest's credentials), so keep it private and delete it when the viewer exits.
+    local ext file
+    ext=$(printf '%s' "$viewer" | jq -r '.ext')
+    file=$(umask 077; mktemp --suffix=".$ext" "${XDG_RUNTIME_DIR:-$CONF_DIR}/isardvdi-console-XXXXXX")
+    trap "rm -f $(printf '%q' "$file")" EXIT   # expanded now: $file is local, gone at exit
+    printf '%s' "$viewer" | jq -r '.content' > "$file"
+    if [[ "$viewer_type" == "file-spice" ]]; then
+        require remote-viewer
+        echo "Opening SPICE console (close the window to return)..." >&2
+        remote-viewer "$file" || true
+        return
+    fi
+
+    local rdp=""
+    for rdp in xfreerdp3 sdl-freerdp3 xfreerdp sdl-freerdp ""; do
+        [[ -n "$rdp" ]] && command -v "$rdp" >/dev/null 2>&1 && break
+    done
+    if [[ -n "$rdp" ]]; then
+        # FreeRDP reads the gateway, its token and the guest credentials from the file; the
+        # flags only make the window resizable and share the clipboard. It runs in the
+        # foreground so you can answer its certificate prompt.
+        echo "Opening RDP with $rdp (close the window to return)..." >&2
+        "$rdp" "$file" +dynamic-resolution /clipboard || true
+    elif command -v remmina >/dev/null 2>&1; then
+        echo "Opening RDP with remmina (close the window to return)..." >&2
+        remmina -c "$file" || true
+    else
+        die "No RDP client found. Install one with: sudo apt install freerdp3-x11"
+    fi
+}
+
+fmt_epoch() { date -d "@$1" '+%F %R'; }
+
+cmd_apikey() {
+    local sub="${1:-status}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        create)
+            local days=365 resp key exp
+            if [[ "${1:-}" == "--days" ]]; then
+                [[ $# -ge 2 ]] || die "--days needs a number"
+                days="$2"
+            elif [[ $# -gt 0 ]]; then
+                die "Usage: isardvdi apikey create [--days N]"
+            fi
+            [[ "$days" =~ ^[0-9]+$ && "$days" -ge 1 && "$days" -le 365 ]] \
+                || die "--days must be 1-365 (the server maximum is one year)"
+            # Creating a key needs a login token; this is the last SAML login (and browser logout).
+            resp=$(_ISARDVDI_LOGIN_TOKEN=1 api_call PUT "/authentication/api-key" \
+                "{\"expiration_minutes\": $((days * 24 * 60))}") || exit 1
+            key=$(printf '%s' "$resp" | jq -r '.api_key // empty')
+            [[ -n "$key" ]] || die "Unexpected response from server: $resp"
+            mkdir -p "$CONF_DIR"
+            chmod 700 "$CONF_DIR"
+            ( umask 077; printf '%s' "$key" > "$APIKEY_FILE" )
+            rm -f "$TOKEN_FILE"
+            exp=$(jwt_exp "$key")
+            echo "API key saved to $APIKEY_FILE (valid until $(fmt_epoch "$exp"))."
+            echo "The CLI no longer signs in, so it won't log your browser out."
+            ;;
+        status)
+            load_config
+            if [[ ! -f "$APIKEY_FILE" ]]; then
+                echo "No API key: using SAML login sessions (each one logs your browser out)."
+                echo "Create one with: isardvdi apikey create"
+                return
+            fi
+            local exp server
+            exp=$(jwt_exp "$(cat "$APIKEY_FILE")")
+            echo "Local key:  $APIKEY_FILE, expires $(fmt_epoch "$exp")"
+            server=$(api_get "/api/v4/item/user/get-api-key") || exit 1
+            if [[ $(printf '%s' "$server" | jq -r '.exists') == "true" ]]; then
+                echo "Server key: expires $(fmt_epoch "$(printf '%s' "$server" | jq -r '.expires')")"
+            else
+                echo "Server key: none on record"
+            fi
+            ;;
+        revoke|delete)
+            [[ -f "$APIKEY_FILE" ]] || die "No API key at $APIKEY_FILE"
+            api_call DELETE "/api/v4/item/user/expire-api-key" >/dev/null || true
+            rm -f "$APIKEY_FILE"
+            echo "Deleted $APIKEY_FILE and the server's record of it. Back to SAML login sessions."
+            echo "Note: IsardVDI does not check keys against that record, so a copy of the key"
+            echo "keeps working until it expires."
+            ;;
+        *) die "Usage: isardvdi apikey [create [--days N] | status | revoke]" ;;
+    esac
+}
+
 cmd_help() {
     cat <<EOF
 isardvdi - CLI for managing IsardVDI virtual desktops via the REST API
@@ -371,6 +624,24 @@ COMMANDS
                                     the sudo command to bring it up.
     vpn-reload                      Rotate keys server-side, refresh the config
                                     and bounce the tunnel in one step. Needs sudo.
+    deployments                     List the deployments you own or co-own.
+    students <deployment>           List a deployment's desktops: student, group, state,
+                                    IP, desktop id.
+    console <desktop> | <deployment> <student> [--browser|--rdp] [--no-start]
+                                    Open a desktop's console, auto-starting it if needed.
+                                    Works for your students' desktops too. Default:
+                                    SPICE in remote-viewer (virt-viewer package).
+                                    --browser: noVNC in your web browser (needs you
+                                    logged in to the portal there). --rdp: RDP through
+                                    IsardVDI's gateway with FreeRDP (freerdp3-x11) or
+                                    Remmina; the desktop needs RDP enabled and its
+                                    WireGuard interface.
+    apikey create [--days N]        Create an API key (default and max 365 days) and use
+                                    it instead of SAML logins. IsardVDI allows one login
+                                    session per user, so every CLI login logs your web
+                                    browser out; an API key doesn't.
+    apikey status                   Show the local key's and the server's key expiry.
+    apikey revoke                   Delete the local key and the server's record of it.
     help, -h, --help                This help.
 
 DESKTOP NAME MATCHING
@@ -397,6 +668,11 @@ FILES
     $TOKEN_FILE
         Cached JWT, auto-refreshed (TTL 30 min, refreshed at 25 min, plus
         transparent retry on HTTP 401). Refresh = silent headless SAML login.
+        Not used while an API key exists.
+    $APIKEY_FILE
+        API key (JWT, valid up to a year). Mode 600. IsardVDI does not check it
+        against the server's record, so it keeps working until it expires even
+        after 'apikey revoke' — treat it as a secret.
     $VPN_FILE
         WireGuard config (\`Address\`, \`PrivateKey\`, peer info). Mode 600.
         This file contains a private key — treat it as a secret.
@@ -431,6 +707,10 @@ case "$cmd" in
     ssh)             cmd_ssh "$@" ;;
     vpn-config|vpn)  cmd_vpn_config "$@" ;;
     vpn-reload|vpn-restart) cmd_vpn_reload "$@" ;;
+    deployments|deps) cmd_deployments "$@" ;;
+    students)        cmd_students "$@" ;;
+    console|viewer)  cmd_console "$@" ;;
+    apikey|api-key)  cmd_apikey "$@" ;;
     help|-h|--help)  cmd_help ;;
     *) err "Unknown command: $cmd"; cmd_help; exit 1 ;;
 esac
