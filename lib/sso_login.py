@@ -51,6 +51,7 @@ def main():
     timeout = args.timeout or (90 if headless else 600)
     password = os.environ.get("ISARDVDI_PASSWORD", "")
     os.makedirs(args.profile, mode=0o700, exist_ok=True)
+    os.chmod(args.profile, 0o700)  # it holds the Microsoft sign-in; mode= only applies on creation
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
