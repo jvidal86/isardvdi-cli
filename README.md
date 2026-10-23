@@ -110,8 +110,9 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
 
 - The API key (acts as you for 90 days) and the cached login token are kept in the **system
   keyring** (GNOME Keyring, KWallet) when there is one, else in `~/.config/isardvdi-cli/apikey` and
-  `token`. Older versions' files move into the keyring by themselves. Over SSH, without a desktop
-  session, the keyring can't be read: run the CLI from the desktop, or keep it file-based there.
+  `token`. Older versions' files move into the keyring by themselves. Only a keyring that is already
+  running is used, so WSL and servers without one keep using the files (`ISARDVDI_KEYRING=0` forces
+  that). A key stored in the keyring can't be read over SSH without a desktop session.
 - `~/.config/isardvdi-cli/isard-vpn.conf` holds a WireGuard **private key** (it must stay a file:
   `wg-quick` reads it); `browser-profile/` holds your **Microsoft** sign-in, which reaches your whole
   Microsoft account, not only IsardVDI. The CLI keeps these mode 600/700, refuses files owned by

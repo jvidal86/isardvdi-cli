@@ -73,7 +73,17 @@ write_secret() {
 # when there is one, else in a private file. "<file>.in-keyring" (it holds no secret) records
 # that the keyring has it, so a locked or unreachable keyring is an error instead of "no key",
 # which would fall back to a sign-in and log the web browser out.
-keyring_ok() { command -v secret-tool >/dev/null 2>&1 && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; }
+keyring_ok() {
+    # Use only a keyring service that is already running. Asking a session without one (WSL,
+    # servers) starts a keyring daemon that waits for an unlock nobody sees: every command hangs.
+    [[ "${ISARDVDI_KEYRING:-1}" != 0 && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
+    command -v secret-tool >/dev/null 2>&1 || return 1
+    command -v gdbus >/dev/null 2>&1 || return 0   # can't tell; the timeouts below still apply
+    [[ $(timeout 5 gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner org.freedesktop.secrets 2>/dev/null) == "(true,)" ]]
+}
+# 60 s leaves time to type the keyring password when it asks to be unlocked.
+keyring() { timeout 60 secret-tool "$@" 2>/dev/null; }
 secret_exists() { [[ -f "$2" || -f "$2.in-keyring" ]]; }
 
 secret_load() {
@@ -81,7 +91,8 @@ secret_load() {
     # has it but can't be read.
     local v
     if [[ -f "$2.in-keyring" ]]; then
-        v=$(secret-tool lookup service isardvdi-cli item "$1" 2>/dev/null) && [[ -n "$v" ]] || return 2
+        keyring_ok || return 2
+        v=$(keyring lookup service isardvdi-cli item "$1") && [[ -n "$v" ]] || return 2
         printf '%s' "$v"
     elif [[ -f "$2" ]]; then
         cat "$2"
@@ -95,9 +106,8 @@ secret_save() {
     local v
     v=$(cat)
     # Read it back before deleting the file: a secret must never be lost to a half-working keyring.
-    if keyring_ok && printf '%s' "$v" \
-            | secret-tool store --label="isardvdi-cli $1" service isardvdi-cli item "$1" 2>/dev/null \
-            && [[ "$(secret-tool lookup service isardvdi-cli item "$1" 2>/dev/null)" == "$v" ]]; then
+    if keyring_ok && printf '%s' "$v" | keyring store --label="isardvdi-cli $1" service isardvdi-cli item "$1" \
+            && [[ "$(keyring lookup service isardvdi-cli item "$1")" == "$v" ]]; then
         rm -f "$2"
         : | write_secret "$2.in-keyring"
     else
@@ -108,7 +118,7 @@ secret_save() {
 
 secret_clear() {
     # secret_clear NAME FILE
-    if [[ -f "$2.in-keyring" ]] && ! secret-tool clear service isardvdi-cli item "$1" 2>/dev/null; then
+    if [[ -f "$2.in-keyring" ]] && ! { keyring_ok && keyring clear service isardvdi-cli item "$1"; }; then
         err "Could not remove '$1' from the keyring (is it locked?). Remove the item"
         err "'isardvdi-cli $1' with your keyring manager."
     fi
@@ -1031,6 +1041,9 @@ DESKTOP NAME MATCHING
 ENVIRONMENT
     ISARDVDI_PASSWORD        Optional: auto-fills the Microsoft password for ONE login run
                              (never stored). Leave unset to type it in the browser.
+    ISARDVDI_KEYRING=0       Keep the API key and token in private files instead of the
+                             system keyring (for WSL or servers without a desktop session;
+                             without a running keyring this happens by itself).
     ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to reach Started state
                              during 'start' and 'ssh'. Default: 180.
     SSH_USER                 Default username for 'isardvdi ssh'. Overrides the
