@@ -13,6 +13,7 @@ APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
 TOKEN_MAX_AGE=$((25 * 60))
 START_TIMEOUT="${ISARDVDI_START_TIMEOUT:-180}"
+MEDIA_TIMEOUT="${ISARDVDI_MEDIA_TIMEOUT:-3600}"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 err() { printf '%s\n' "$*" >&2; }
@@ -106,7 +107,7 @@ api_call() {
     load_config
     local method="$1" path="$2" data="${3:-}" resp status body attempt jwt
     local body_args=()
-    [[ -n "$data" ]] && body_args=(-H "Content-Type: application/json" --data "$data")
+    [[ -n "$data" ]] && body_args=(-H "Content-Type: application/json" --data-binary "$data")
     for attempt in 1 2; do
         jwt=$(get_jwt) || return 1
         resp=$(curl -sS -X "$method" -w '\n%{http_code}' \
@@ -140,6 +141,26 @@ desktop_detail_json() { api_get "/api/v4/item/desktop/$1/get-info"; }
 # Use this for status+ip lookups (start/ssh polling).
 desktop_from_list() { list_desktops_json | jq --arg id "$1" '.[] | select(.id == $id)'; }
 
+pick_by_name() {
+    # pick_by_name KIND JSON-ARRAY QUERY. Prints the id of the one item whose id equals QUERY or
+    # whose name contains it (case-insensitive); an exact name match wins over substrings.
+    local kind="$1" json="$2" query="$3" matches count
+    matches=$(printf '%s' "$json" | jq -r --arg q "$query" '
+        ([.[] | select(.id == $q or (.name | ascii_downcase) == ($q | ascii_downcase))] | unique_by(.id)) as $exact
+        | (if ($exact | length) == 1 then $exact
+           else [.[] | select(.name | ascii_downcase | contains($q | ascii_downcase))] | unique_by(.id) end)
+        | .[] | [.id, .name] | @tsv')
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    if [[ "$count" == "0" ]]; then
+        die "No $kind matches \"$query\""
+    elif [[ "$count" != "1" ]]; then
+        err "Multiple ${kind}s match \"$query\":"
+        printf '%s\n' "$matches" >&2
+        die "Be more specific (try the full name or the id)."
+    fi
+    printf '%s' "$matches" | cut -f1
+}
+
 list_deployments_json() { api_get "/api/v4/items/deployments" | jq '.deployments // .'; }
 # The videowall endpoint returns every desktop of a deployment (with its student) in one call.
 deployment_desktops_json() { api_get "/api/v4/item/deployment/$1/videowall" | jq '.desktops // []'; }
@@ -163,15 +184,6 @@ match_one() {
     printf '%s' "$matches" | cut -f1
 }
 
-find_desktop() {
-    local query="$1"
-    if [[ "$query" =~ $UUID_RE ]]; then
-        printf '%s' "$query"
-        return
-    fi
-    list_desktops_json | match_one desktop "$query" name
-}
-
 find_deployment() {
     local query="$1"
     if [[ "$query" =~ $UUID_RE ]]; then
@@ -180,6 +192,34 @@ find_deployment() {
     fi
     list_deployments_json | match_one deployment "$query" name
 }
+
+find_desktop() {
+    if [[ "$1" =~ $UUID_RE ]]; then
+        printf '%s' "$1"
+        return
+    fi
+    pick_by_name desktop "$(list_desktops_json)" "$1"
+}
+
+# Media: your own plus the media other users shared with you, tagged with .source.
+media_json() {
+    jq -s '(.[0].media | map(. + {source: "mine"})) + (.[1].media | map(. + {source: "shared"}))' \
+        <(api_get "/api/v4/items/media") <(api_get "/api/v4/items/media/get-shared")
+}
+find_media() { pick_by_name "media item" "$(media_json)" "$1"; }
+templates_json() { api_get "/api/v4/items/templates" | jq '.templates? // .'; }
+find_template() { pick_by_name template "$(templates_json)" "$1"; }
+find_group() {
+    # Group search used by the web UI's sharing picker (works for non-admin roles).
+    local found
+    found=$(api_call POST "/api/v4/items/alloweds/term/groups" \
+        "$(jq -nc --arg t "$1" '{table: "groups", term: $t}')")
+    pick_by_name group "$found" "$1"
+}
+
+# Name rule of the web UI's media/template forms (4-50 chars).
+NAME_RE='^[-_àèìòùáéíóúñçÀÈÌÒÙÁÉÍÓÚÑÇ .a-zA-Z0-9]{4,50}$'
+check_name() { [[ "$1" =~ $NAME_RE ]] || die "Invalid name \"$1\": 4-50 letters, digits, spaces, . _ -"; }
 
 vpn_iface() { basename "$VPN_FILE" .conf; }
 vpn_iface_up() { ip link show "$(vpn_iface)" >/dev/null 2>&1; }
@@ -301,6 +341,31 @@ cmd_stop() {
         api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null || true
         echo "Force-stop re-issued"
     fi
+}
+
+cmd_viewer() {
+    # Writes the desktop's SPICE connection file (.vv) and prints its path. The file holds a
+    # one-time console password, so it is created mode 600 and its content is never printed.
+    [[ $# -ge 1 ]] || die "Usage: isardvdi viewer <name|id> [FILE.vv]"
+    local id out body path
+    id=$(find_desktop "$1")
+    out="${2:-${TMPDIR:-/tmp}/isard-$id.vv}"
+    for path in "/api/v4/item/desktop/$id/get-viewer/file-spice" "/api/v3/desktop/$id/viewer/file-spice"; do
+        if body=$(api_get "$path"); then
+            [[ -n "${ISARDVDI_DEBUG:-}" ]] && err "$path: ${body:0:24}…"
+            if [[ "$body" == "[virt-viewer]"* ]]; then
+                ( umask 077; printf '%s\n' "$body" > "$out" )          # the file itself
+            else
+                ( umask 077; printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null > "$out" ) || true
+            fi
+            if [[ -s "$out" ]]; then
+                echo "$out"
+                return
+            fi
+        fi
+    done
+    rm -f "$out"
+    die "Could not get the SPICE file for $id (is the desktop started?)"
 }
 
 cmd_ssh() {
@@ -593,6 +658,161 @@ cmd_apikey() {
     esac
 }
 
+wait_media() {
+    # $1=id, $2=timeout-seconds. Returns 0 once the server has the whole file.
+    local id="$1" timeout="$2" elapsed=0 m state pct last=""
+    while [[ $elapsed -lt $timeout ]]; do
+        m=$(media_json | jq --arg id "$id" '.[] | select(.id == $id)')
+        state=$(printf '%s' "$m" | jq -r '.status // "?"')
+        pct=$(printf '%s' "$m" | jq -r '.progress.received_percent // 0')
+        case "$state" in
+            Downloaded) return 0 ;;
+            *Fail*|*Error*|Deleted) err "Media $id ended in state $state"; return 1 ;;
+        esac
+        if [[ "$state/$pct" != "$last" ]] || (( elapsed % 30 == 0 )); then
+            printf '  [%4ds/%ds] state=%s %s%%\n' "$elapsed" "$timeout" "$state" "$pct" >&2
+            last="$state/$pct"
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    err "Timed out after $timeout s; the download goes on server-side. Check: isardvdi media status $id"
+    return 1
+}
+
+cmd_media() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        list|ls)
+            media_json | jq -r '
+                (["NAME","KIND","STATUS","SOURCE","ID"]),
+                (.[] | [.name, .kind, (.status + (if .status == "Downloading"
+                        then " \(.progress.received_percent // 0)%" else "" end)), .source, .id])
+                | @tsv' | column -t -s$'\t'
+            ;;
+        status)
+            [[ $# -ge 1 ]] || die "Usage: isardvdi media status <name|id>"
+            local id
+            id=$(find_media "$1")
+            media_json | jq --arg id "$id" '.[] | select(.id == $id)'
+            ;;
+        add)
+            # The server downloads the file itself: IsardVDI has no upload endpoint.
+            local kind=iso wait=1 name="" url="" body id
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --kind) [[ $# -ge 2 ]] || die "--kind needs iso|floppy"; kind="$2"; shift 2 ;;
+                    --no-wait) wait=0; shift ;;
+                    -*) die "Unknown flag: $1" ;;
+                    *) if [[ -z "$name" ]]; then name="$1"; elif [[ -z "$url" ]]; then url="$1"
+                       else die "Too many arguments"; fi; shift ;;
+                esac
+            done
+            [[ -n "$url" ]] || die "Usage: isardvdi media add <name> <https-url> [--kind iso|floppy] [--no-wait]"
+            check_name "$name"
+            [[ "$url" == https://* ]] || die "The URL must be https:// (IsardVDI rejects anything else)"
+            [[ "$kind" == iso || "$kind" == floppy ]] || die "--kind must be iso or floppy"
+            body=$(api_call POST "/api/v4/item/media" "$(jq -nc --arg n "$name" --arg u "$url" --arg k "$kind" \
+                '{name: $n, description: "", kind: $k, url: $u, hypervisors_pools: ["default"],
+                  allowed: {users: false, groups: false}}')")
+            id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)
+            [[ -n "$id" ]] || id=$(find_media "$name")
+            echo "Media $id created; the server is downloading it."
+            if [[ $wait -eq 1 ]]; then
+                wait_media "$id" "$MEDIA_TIMEOUT" || exit 1
+                echo "Downloaded: $id"
+            fi
+            ;;
+        desktop)
+            # New desktop booting from a media, e.g. to install an OS. SATA by default: Windows Setup
+            # has no virtio driver and would find no disk.
+            local media="" name="" os="" memory=4 vcpus=2 disk=40 bus=sata boot=iso nets="default" m id body
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --os|--memory|--vcpus|--disk|--bus|--boot|--net)
+                        [[ $# -ge 2 ]] || die "$1 needs a value"
+                        case "$1" in
+                            --os) os="$2" ;; --memory) memory="$2" ;; --vcpus) vcpus="$2" ;;
+                            --disk) disk="$2" ;; --bus) bus="$2" ;; --boot) boot="$2" ;; --net) nets="$2" ;;
+                        esac
+                        shift 2 ;;
+                    -*) die "Unknown flag: $1" ;;
+                    *) if [[ -z "$media" ]]; then media="$1"; elif [[ -z "$name" ]]; then name="$1"
+                       else die "Too many arguments"; fi; shift ;;
+                esac
+            done
+            [[ -n "$name" && -n "$os" ]] || die "Usage: isardvdi media desktop <media> <desktop-name> --os <id> [options]
+See 'isardvdi media installs' for --os ids."
+            check_name "$name"
+            id=$(find_media "$media")
+            m=$(media_json | jq --arg id "$id" '.[] | select(.id == $id)')
+            [[ $(printf '%s' "$m" | jq -r .status) == Downloaded ]] || die "Media $id is not Downloaded yet"
+            body=$(api_call POST "/api/v4/item/desktop/from-media" "$(jq -nc \
+                --arg mid "$id" --arg kind "$(printf '%s' "$m" | jq -r .kind)" --arg os "$os" --arg n "$name" \
+                --argjson mem "$memory" --argjson cpu "$vcpus" --argjson disk "$disk" \
+                --arg bus "$bus" --arg boot "$boot" --arg nets "$nets" \
+                '{media_id: $mid, kind: $kind, os_template: $os, name: $n, description: "",
+                  guest_properties: {credentials: {username: "", password: ""}, fullscreen: false,
+                      viewers: {browser_vnc: {options: null}, file_spice: {options: null}}},
+                  hardware: {boot_order: [$boot], disk_bus: $bus, disk_size: $disk,
+                      interfaces: ($nets | split(",")), memory: $mem, vcpus: $cpu,
+                      videos: ["default"], reservables: {vgpus: ["None"]}}}')")
+            id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)
+            echo "Desktop \"$name\" created${id:+: $id}. It boots from the media; nothing was started."
+            ;;
+        installs)
+            # OS profiles for 'media desktop --os' (libosinfo ids such as win11, ubuntu24.04).
+            api_get "/api/v4/items/media/installs" | jq -r '
+                (["ID","NAME"]), (.installs[] | [.id, .name]) | @tsv' | column -t -s$'\t' \
+                | { [[ $# -ge 1 ]] && grep -iE "^ID|$1" || cat; }
+            ;;
+        *) die "Usage: isardvdi media list|status|add|desktop|installs (see: isardvdi help)" ;;
+    esac
+}
+
+cmd_template() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        list|ls)
+            templates_json | jq -r '
+                (["NAME","ENABLED","STATUS","ID"]),
+                (.[] | [.name, (.enabled | tostring), .status, .id])
+                | @tsv' | column -t -s$'\t'
+            ;;
+        create)
+            # The template copies the desktop's disk as it is now, so for an install exercise make it
+            # from a desktop that was never installed into. The desktop must be stopped.
+            local desktop="" name="" enabled=true groups=() gids=() g id d state body
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --group) [[ $# -ge 2 ]] || die "--group needs a name or id"; groups+=("$2"); shift 2 ;;
+                    --disabled) enabled=false; shift ;;
+                    -*) die "Unknown flag: $1" ;;
+                    *) if [[ -z "$desktop" ]]; then desktop="$1"; elif [[ -z "$name" ]]; then name="$1"
+                       else die "Too many arguments"; fi; shift ;;
+                esac
+            done
+            [[ -n "$name" ]] || die "Usage: isardvdi template create <desktop> <template-name> [--group G]... [--disabled]"
+            check_name "$name"
+            id=$(find_desktop "$desktop")
+            d=$(desktop_from_list "$id")
+            state=$(printf '%s' "$d" | jq -r '.status')
+            [[ "$state" == Stopped ]] || die "Desktop must be Stopped (it is $state): isardvdi stop $id"
+            for g in "${groups[@]}"; do gids+=("$(find_group "$g")"); done
+            body=$(api_call POST "/api/v4/item/template" "$(jq -nc --arg d "$id" --arg n "$name" \
+                --argjson en "$enabled" --args '{desktop_id: $d, name: $n, description: "", enabled: $en,
+                    allowed: {users: false, groups: (if $ARGS.positional == [] then false else $ARGS.positional end)}}' \
+                "${gids[@]}")")
+            id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)
+            echo "Template \"$name\" requested${id:+: $id}${gids[*]:+, shared with ${#gids[@]} group(s)}."
+            echo "The server copies the disk now; check progress with: isardvdi template list"
+            ;;
+        *) die "Usage: isardvdi template list|create (see: isardvdi help)" ;;
+    esac
+}
+
 cmd_help() {
     cat <<EOF
 isardvdi - CLI for managing IsardVDI virtual desktops via the REST API
@@ -611,6 +831,9 @@ COMMANDS
     start  <name|id>                Start a desktop and wait until it reaches state
                                     "Started" with an IP. See ISARDVDI_START_TIMEOUT.
     stop   [--force] <name|id>      Stop a desktop. --force re-issues stop after 0.5 s.
+    viewer <name|id> [FILE.vv]      Save the SPICE connection file of a started desktop
+                                    (mode 600, one-time password inside) and print its
+                                    path. Open it with remote-viewer (virt-viewer).
     ssh    <name|id> [-l USER] [--no-start] [-- SSH-ARGS...]
                                     SSH into a (running) desktop. If it isn't
                                     running, it's auto-started first (suppress with
@@ -642,6 +865,24 @@ COMMANDS
                                     browser out; an API key doesn't.
     apikey status                   Show the local key's and the server's key expiry.
     apikey revoke                   Delete the local key and the server's record of it.
+    media list                      Your media plus media shared with you (name, kind,
+                                    status, mine/shared, id).
+    media status <name|id>          One media item as JSON (status, download progress).
+    media add <name> <https-url> [--kind iso|floppy] [--no-wait]
+                                    Register a media. IsardVDI has no upload: the server
+                                    downloads the URL itself, so it must be reachable from
+                                    the internet (e.g. a presigned S3 link). Waits until
+                                    "Downloaded" (see ISARDVDI_MEDIA_TIMEOUT).
+    media installs [FILTER]         OS profiles for --os (win10, win11, ubuntu24.04, ...).
+    media desktop <media> <desktop-name> --os ID [--memory GB] [--vcpus N] [--disk GB]
+                  [--bus sata|virtio|ide|default] [--boot iso|disk|pxe] [--net ID[,ID]]
+                                    New desktop that boots from the media, to install an
+                                    OS. Defaults: 4 GB, 2 vCPU, 40 GB, sata (Windows Setup
+                                    has no virtio driver), boot iso, net default.
+    template list                   Your templates (name, enabled, status, id).
+    template create <desktop> <template-name> [--group NAME|ID]... [--disabled]
+                                    Make a template from a stopped desktop and share it with
+                                    each --group (repeatable). The disk is copied as it is.
     help, -h, --help                This help.
 
 DESKTOP NAME MATCHING
@@ -655,6 +896,7 @@ ENVIRONMENT
                              (never stored). Leave unset to type it in the browser.
     ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to reach Started state
                              during 'start' and 'ssh'. Default: 180.
+    ISARDVDI_MEDIA_TIMEOUT   Seconds 'media add' waits for the download. Default: 3600.
     SSH_USER                 Default username for 'isardvdi ssh'. Overrides the
                              "isard" fallback and is itself overridden by '-l USER'.
                              Read from the config file by default.
@@ -685,6 +927,9 @@ EXAMPLES
     isardvdi ssh hermes -l ubuntu -- -p 2222
     ISARDVDI_START_TIMEOUT=300 isardvdi ssh hermes
     isardvdi vpn-reload
+    isardvdi media add "tiny11 Core x64" "https://s3.example.com/bucket/tiny11.iso?X-Amz-..."
+    isardvdi media desktop tiny11 "Install tiny11" --os win11
+    isardvdi template create "Install tiny11" "Practica install tiny11" --group 26-27_ASIX1
 
 EXIT STATUS
     0  Success.
@@ -705,12 +950,16 @@ case "$cmd" in
     start)           cmd_start "$@" ;;
     stop)            cmd_stop "$@" ;;
     ssh)             cmd_ssh "$@" ;;
+    viewer|spice)    cmd_viewer "$@" ;;
+    get)             [[ $# -ge 1 ]] || die "Usage: isardvdi get </api/path>"; api_get "$1"; echo ;;
     vpn-config|vpn)  cmd_vpn_config "$@" ;;
     vpn-reload|vpn-restart) cmd_vpn_reload "$@" ;;
     deployments|deps) cmd_deployments "$@" ;;
     students)        cmd_students "$@" ;;
-    console|viewer)  cmd_console "$@" ;;
+    console)         cmd_console "$@" ;;
     apikey|api-key)  cmd_apikey "$@" ;;
+    media)           cmd_media "$@" ;;
+    template|templates) cmd_template "$@" ;;
     help|-h|--help)  cmd_help ;;
     *) err "Unknown command: $cmd"; cmd_help; exit 1 ;;
 esac
