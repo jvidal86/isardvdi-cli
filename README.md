@@ -11,7 +11,7 @@ but any IsardVDI URL works.
 curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.sh | sh
 ```
 
-Installs `~/.local/bin/isardvdi` and `~/.local/share/isardvdi-cli/sso_login.py` (no sudo). To also
+Installs `~/.local/bin/isardvdi` and its helpers in `~/.local/share/isardvdi-cli/` (no sudo). To also
 install the Python dependency (Playwright + Chromium) in the same step:
 
 ```sh
@@ -19,10 +19,14 @@ curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.
 ```
 
 Requirements: `curl`, `jq`, `python3`, `ssh`, Python `playwright` (+ Chromium), and `wireguard-tools`
-if you want to reach desktops over the VPN. For `console`: `virt-viewer` (SPICE, the default) and,
+if you want to reach desktops over the VPN. Recommended: `libsecret-tools` (keeps the API key in the
+system keyring) and `python3-cryptography` (renews the key from Chromium-based browsers). For `console`: `virt-viewer` (SPICE, the default) and,
 for `--rdp`, `freerdp3-x11` (or Remmina).
 
 Pin a version with `ISARDVDI_REF=<tag-or-commit>`; change locations with `BIN_DIR` / `DATA_DIR`.
+Piping a script into `sh` runs whatever the URL serves at that moment. To check first, download
+`install.sh`, read it, and run it with `ISARDVDI_REF` set to a full commit hash, which can't be
+changed afterwards.
 
 ## First run
 
@@ -41,11 +45,22 @@ logged out (and vice versa). Teachers and other `advanced` users can avoid this 
 which has no session:
 
 ```sh
-isardvdi apikey create            # one last SAML login; key valid 365 days (--days N for less)
+isardvdi apikey create --from-browser   # key valid 90 days (--days N, at most 365)
 isardvdi apikey status
 ```
 
-From then on the CLI only uses the key. When it expires, run `apikey create` again.
+`--from-browser` creates the key with the portal session of the web browser on this computer, so
+the browser stays logged in (a key can't create its own replacement, and a Microsoft sign-in would
+log the browser out). Have the portal open in your browser when you run it. Firefox and the
+Chromium-based browsers (Chrome, Chromium, Vivaldi, Brave, Edge) are read automatically; their
+cookie key comes from KWallet or the Secret Service, and KWallet may ask once whether to allow
+`isardvdi-cli`. Only the portal's cookie is read. If no session is found, the CLI asks you to paste
+the cookie: DevTools (F12) → Application (Firefox: Storage) → Cookies → the portal, value of
+`isardvdi_session` (or `authorization`).
+
+From then on the CLI only uses the key, which it keeps in the system keyring. In the key's last 30
+days it renews itself the same way, at most once an hour, whenever the portal is open in your
+browser. It only reminds you if that keeps failing for two weeks.
 
 ## Commands
 
@@ -60,8 +75,9 @@ From then on the CLI only uses the key. When it expires, run `apikey create` aga
 | `vpn-reload` | Rotate keys and bounce the tunnel (**breaks a working tunnel if misused**) |
 | `deployments` | Deployments you own or co-own |
 | `students <deployment>` | A deployment's desktops: student, group, state, IP, id |
-| `console <desktop>` / `console <deployment> <student> [--browser\|--rdp]` | Auto-start if needed, then open the console (SPICE by default) |
-| `apikey create [--days N]` / `status` / `revoke` | Use an API key instead of SAML logins (see below) |
+| `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
+| `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
+| `forget` | Delete every secret stored on this computer (before leaving a shared one) |
 
 `<name|id>` is an exact UUID or a case-insensitive substring of the desktop name.
 See `isardvdi help` for environment variables (`ISARDVDI_START_TIMEOUT`, `SSH_USER`, ...).
@@ -92,12 +108,29 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
 
 ## Files and security
 
-- `~/.config/isardvdi-cli/isard-vpn.conf` holds a WireGuard **private key**; `token` is a cached JWT;
-  `browser-profile/` is a saved login; `apikey` acts as you for up to a year. All are created
-  mode 600/700 — treat them as secrets.
+- The API key (acts as you for 90 days) and the cached login token are kept in the **system
+  keyring** (GNOME Keyring, KWallet) when there is one, else in `~/.config/isardvdi-cli/apikey` and
+  `token`. Older versions' files move into the keyring by themselves. Over SSH, without a desktop
+  session, the keyring can't be read: run the CLI from the desktop, or keep it file-based there.
+- `~/.config/isardvdi-cli/isard-vpn.conf` holds a WireGuard **private key** (it must stay a file:
+  `wg-quick` reads it); `browser-profile/` holds your **Microsoft** sign-in, which reaches your whole
+  Microsoft account, not only IsardVDI. The CLI keeps these mode 600/700, refuses files owned by
+  another user, and fixes looser permissions when it starts.
+- On a shared computer, run `isardvdi forget` when you leave: it deletes the API key (and the
+  server's record of it), the token, the VPN config and the Microsoft sign-in.
 - IsardVDI does not check API keys against its stored record, so `isardvdi apikey revoke` only
-  deletes the local file and that record: a leaked copy keeps working until it expires. Prefer
-  a shorter `--days` on shared machines.
+  deletes the local key and that record: a leaked copy keeps working until it expires, which is
+  why keys last 90 days and renew themselves. Prefer a shorter `--days` on shared machines.
+- **What comes from the server is checked before use.** Before `sudo wg-quick` runs the VPN
+  config as root, the CLI refuses any setting IsardVDI doesn't send to users (`PostUp` and other
+  command hooks, `DNS`, a route for all traffic). IP addresses, viewer URLs and viewer file types
+  are validated, and names are stripped of terminal control characters before printing.
+- **Consoles share no local devices.** IsardVDI's default RDP file shares your printers, smartcards
+  and clipboard with the desktop, and a student controls their own desktop. `console` turns off
+  every USB, drive, printer and smartcard redirection, and shares the clipboard only with your
+  own desktops (`--clipboard` to share it with a student's, who could then read what you copy).
+- `ssh` remembers each desktop's host key under the desktop's id (`HostKeyAlias`), not its VPN IP,
+  which IsardVDI reuses. A host key warning therefore means a different machine: don't ignore it.
 - Do not store desktop passwords in the IsardVDI portal (descriptions and credentials are plain text).
 
 ## License

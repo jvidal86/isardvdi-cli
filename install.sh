@@ -13,6 +13,8 @@
 #   ISARDVDI_REF=main                        branch/tag/commit to install
 #   ISARDVDI_INSTALL_DEPS=1                  also pip-install Playwright + Chromium (user site)
 set -eu
+# Installed code must not be writable by group/others, whatever the caller's umask.
+umask 022
 
 REPO="jvidal86/isardvdi-cli"
 REF="${ISARDVDI_REF:-main}"
@@ -40,18 +42,23 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 info "downloading ($REF)"
 download "$BASE/bin/isardvdi"     "$tmp/isardvdi"      || err "download failed: $BASE/bin/isardvdi"
 download "$BASE/lib/sso_login.py" "$tmp/sso_login.py"  || err "download failed: $BASE/lib/sso_login.py"
+download "$BASE/lib/browser_token.py" "$tmp/browser_token.py" || err "download failed: $BASE/lib/browser_token.py"
 head -1 "$tmp/isardvdi" | grep -q '^#!' || err "downloaded file does not look like a script"
 
 mkdir -p "$BIN_DIR" "$DATA_DIR"
 install -m 0755 "$tmp/isardvdi"     "$BIN_DIR/isardvdi"
 install -m 0644 "$tmp/sso_login.py" "$DATA_DIR/sso_login.py"
-info "installed $BIN_DIR/isardvdi and $DATA_DIR/sso_login.py"
+install -m 0644 "$tmp/browser_token.py" "$DATA_DIR/browser_token.py"
+info "installed $BIN_DIR/isardvdi and its helpers in $DATA_DIR"
 
 # Dependencies. Playwright (Python) drives the Microsoft SSO sign-in.
 missing=""
 for c in curl jq python3 ssh; do have "$c" || missing="$missing $c"; done
 [ -z "$missing" ] || info "missing tools:$missing  (e.g. sudo apt install curl jq python3 openssh-client)"
 info "optional: wireguard-tools (wg-quick) to reach desktops over the IsardVDI VPN"
+have secret-tool || info "recommended: libsecret-tools (secret-tool) to keep the API key in the system keyring"
+python3 -c 'import cryptography' 2>/dev/null \
+    || info "recommended: python3-cryptography, to renew the API key from Chrome/Chromium/Vivaldi/Brave/Edge"
 
 if have python3 && ! python3 -c 'import playwright' 2>/dev/null; then
     if [ "${ISARDVDI_INSTALL_DEPS:-0}" = "1" ]; then

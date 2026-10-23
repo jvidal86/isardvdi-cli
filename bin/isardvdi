@@ -8,12 +8,19 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/isardvdi-cli"
 CONF_FILE="$CONF_DIR/config"
 PROFILE_DIR="$CONF_DIR/browser-profile"
 HELPER="${ISARDVDI_SSO_HELPER:-${XDG_DATA_HOME:-$HOME/.local/share}/isardvdi-cli/sso_login.py}"
+BROWSER_HELPER="$(dirname "$HELPER")/browser_token.py"
 TOKEN_FILE="$CONF_DIR/token"
 APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
-TOKEN_MAX_AGE=$((25 * 60))
+RENEW_STAMP="$CONF_DIR/renew-attempt"
+KEY_DAYS=90      # default API key lifetime (server maximum: 365)
+RENEW_DAYS=30    # renew automatically when the key has less than this left
+WARN_DAYS=14     # ... and warn when renewing keeps failing
 START_TIMEOUT="${ISARDVDI_START_TIMEOUT:-180}"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+# Set only by 'apikey create --from-browser'. Unset first so an inherited (exported) value is
+# never used, and the plain assignment later stays out of child processes' environments.
+unset PORTAL_JWT
 
 err() { printf '%s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
@@ -23,15 +30,132 @@ require curl
 require jq
 require python3
 
+# Server data is untrusted on the way to the terminal: strip control characters (escape
+# sequences can rewrite the screen, set the clipboard, ...). JQ_CLEAN is the same for jq output.
+sanitize() { printf '%s' "$*" | tr -d '\000-\010\013-\037\177'; }
+JQ_CLEAN='def clean: tostring | gsub("\\p{Cc}"; "?");'
+
+valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; }
+valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+private_path() {
+    # Refuse a path another user owns; remove group/other permissions from ours (like ssh does).
+    # Nobody else may read our secrets, or write the config, which is sourced as shell code.
+    [[ -e "$1" ]] || return 0
+    [[ -O "$1" ]] || die "Refusing to use $1: it is owned by another user."
+    if [[ -n $(find "$1" -maxdepth 0 -perm /077) ]]; then
+        chmod go-rwx "$1"
+        err "Fixed the permissions of $1 (other users could access it)."
+    fi
+}
+
+secure_conf() {
+    local f
+    for f in "$CONF_DIR" "$CONF_FILE" "$TOKEN_FILE" "$APIKEY_FILE" "$VPN_FILE" "$PROFILE_DIR"; do
+        private_path "$f"
+    done
+}
+
+write_secret() {
+    # write_secret FILE < CONTENT. Atomic and mode 600, even when FILE already existed with
+    # looser permissions (a plain '>' keeps the old mode).
+    local tmp
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$CONF_DIR"
+    tmp=$(umask 077; mktemp "$1.XXXXXX")
+    if ! { cat > "$tmp" && mv -f "$tmp" "$1"; }; then
+        rm -f "$tmp"
+        die "Could not write $1"
+    fi
+}
+
+# The API key and the login token live in the system keyring (Secret Service, via secret-tool)
+# when there is one, else in a private file. "<file>.in-keyring" (it holds no secret) records
+# that the keyring has it, so a locked or unreachable keyring is an error instead of "no key",
+# which would fall back to a sign-in and log the web browser out.
+keyring_ok() { command -v secret-tool >/dev/null 2>&1 && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; }
+secret_exists() { [[ -f "$2" || -f "$2.in-keyring" ]]; }
+
+secret_load() {
+    # secret_load NAME FILE. Stdout: the secret. Returns 1 if there is none, 2 if the keyring
+    # has it but can't be read.
+    local v
+    if [[ -f "$2.in-keyring" ]]; then
+        v=$(secret-tool lookup service isardvdi-cli item "$1" 2>/dev/null) && [[ -n "$v" ]] || return 2
+        printf '%s' "$v"
+    elif [[ -f "$2" ]]; then
+        cat "$2"
+    else
+        return 1
+    fi
+}
+
+secret_save() {
+    # secret_save NAME FILE < SECRET. Into the keyring if possible, else into FILE (mode 600).
+    local v
+    v=$(cat)
+    # Read it back before deleting the file: a secret must never be lost to a half-working keyring.
+    if keyring_ok && printf '%s' "$v" \
+            | secret-tool store --label="isardvdi-cli $1" service isardvdi-cli item "$1" 2>/dev/null \
+            && [[ "$(secret-tool lookup service isardvdi-cli item "$1" 2>/dev/null)" == "$v" ]]; then
+        rm -f "$2"
+        : | write_secret "$2.in-keyring"
+    else
+        printf '%s' "$v" | write_secret "$2"
+        rm -f "$2.in-keyring"
+    fi
+}
+
+secret_clear() {
+    # secret_clear NAME FILE
+    if [[ -f "$2.in-keyring" ]] && ! secret-tool clear service isardvdi-cli item "$1" 2>/dev/null; then
+        err "Could not remove '$1' from the keyring (is it locked?). Remove the item"
+        err "'isardvdi-cli $1' with your keyring manager."
+    fi
+    rm -f "$2" "$2.in-keyring"
+}
+
+secret_where() { if [[ -f "$2.in-keyring" ]]; then echo "the system keyring"; else echo "$2"; fi; }
+
+migrate_secrets() {
+    # Older versions kept the API key and the token in files: move them into the keyring.
+    keyring_ok || return 0
+    local name file value
+    for name in apikey token; do
+        file="$CONF_DIR/$name"
+        [[ -f "$file" && ! -f "$file.in-keyring" ]] || continue
+        value=$(cat "$file")
+        printf '%s' "$value" | secret_save "$name" "$file"
+        [[ ! -f "$file.in-keyring" ]] || err "Moved $file into the system keyring."
+    done
+}
+
 load_config() {
     [[ -f "$CONF_FILE" ]] || die "No config found. Run: isardvdi init"
+    # secure_conf has already run (main dispatch), so the file is ours and private.
     # shellcheck disable=SC1090
     . "$CONF_FILE"
     [[ -n "${URL:-}" ]] || die "Config $CONF_FILE missing URL. Run: isardvdi init"
+    # Tokens are only ever sent over HTTPS.
+    valid_url "$URL" || die "Config URL must look like https://host (got: $(sanitize "$URL")). Run: isardvdi init"
+}
+
+check_helper() {
+    # check_helper FILE. Helpers run with our credentials: nobody else may be able to change them.
+    local p
+    for p in "$1" "$(dirname "$1")"; do
+        [[ -e "$p" ]] || die "Helper not found: $1 (reinstall isardvdi-cli)"
+        if [[ -O "$p" ]]; then
+            [[ -z $(find "$p" -maxdepth 0 -perm /022) ]] || chmod go-w "$p"
+        elif [[ $(stat -c %u "$p") != 0 || -n $(find "$p" -maxdepth 0 -perm /022) ]]; then
+            die "Refusing to run $1: $p is writable by, or owned by, another user."
+        fi
+    done
 }
 
 sso_login() {
     # Stdout: raw JWT. Pass --visible for an interactive browser sign-in.
+    check_helper "$HELPER"
     python3 "$HELPER" --url "$URL" --profile "$PROFILE_DIR" --user "${USERNAME:-}" "$@"
 }
 
@@ -47,6 +171,9 @@ do_login() {
         if [[ -t 0 && -t 2 ]]; then
             err "Silent sign-in not possible; opening the browser..."
             jwt=$(sso_login --visible) || return 1
+        elif secret_exists apikey "$APIKEY_FILE"; then
+            err "Microsoft wants an interactive sign-in. Use instead: isardvdi apikey create --from-browser"
+            return 1
         else
             err "Sign-in expired. Run: isardvdi login"
             return 1
@@ -58,45 +185,56 @@ do_login() {
     printf '%s' "$jwt"
 }
 
-token_age_seconds() {
-    local now mtime
-    now=$(date +%s)
-    mtime=$(stat -c %Y "$TOKEN_FILE" 2>/dev/null || echo 0)
-    echo $((now - mtime))
+jwt_payload() {
+    # Stdout: the decoded payload (JSON) of a JWT, or nothing if it can't be decoded.
+    local p
+    p=$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')
+    case $((${#p} % 4)) in 2) p="$p==" ;; 3) p="$p=" ;; esac
+    printf '%s' "$p" | base64 -d 2>/dev/null | jq -c 'objects' 2>/dev/null || true
 }
 
 jwt_exp() {
     # Stdout: the "exp" claim (epoch seconds) of a JWT, or nothing if it can't be decoded.
-    local p
-    p=$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')
-    case $((${#p} % 4)) in 2) p="$p==" ;; 3) p="$p=" ;; esac
-    printf '%s' "$p" | base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null || true
+    jwt_payload "$1" | jq -r '.exp // empty'
 }
 
 # An API key has its own pseudo-session ("api-key"), so using it never creates or revokes a
 # login session. Login sessions are one per user: every SAML login logs out the web browser.
 # _ISARDVDI_LOGIN_TOKEN=1 forces the login token (needed to create an API key).
-using_apikey() { [[ -z "${_ISARDVDI_LOGIN_TOKEN:-}" && -f "$APIKEY_FILE" ]]; }
+using_apikey() { [[ -z "${_ISARDVDI_LOGIN_TOKEN:-}" ]] && secret_exists apikey "$APIKEY_FILE"; }
+apikey_exp() { jwt_exp "$(secret_load apikey "$APIKEY_FILE" || true)"; }
+apikey_expired() { local exp; exp=$(apikey_exp); [[ -n "$exp" && "$exp" -le $(date +%s) ]]; }
 
 get_jwt() {
     load_config
+    if [[ -n "${PORTAL_JWT:-}" ]]; then
+        printf '%s' "$PORTAL_JWT"
+        return
+    fi
+    local jwt exp
     if using_apikey; then
-        local key exp
-        key=$(cat "$APIKEY_FILE")
-        exp=$(jwt_exp "$key")
+        jwt=$(secret_load apikey "$APIKEY_FILE") \
+            || die "The API key is in the system keyring, which can't be read now (locked, or no
+desktop session, e.g. over SSH). Unlock the keyring, or run this from your desktop session."
+        exp=$(jwt_exp "$jwt")
         if [[ -n "$exp" && "$exp" -le $(date +%s) ]]; then
-            die "API key expired on $(date -d "@$exp" '+%F %R'). Run: isardvdi apikey create"
+            die "API key expired on $(fmt_epoch "$exp"). Open the portal in your browser, then run:
+    isardvdi apikey create --from-browser
+(or 'isardvdi apikey revoke' to go back to SAML sign-ins)"
         fi
-        printf '%s' "$key"
+        printf '%s' "$jwt"
         return
     fi
-    if [[ -f "$TOKEN_FILE" ]] && [[ $(token_age_seconds) -lt $TOKEN_MAX_AGE ]]; then
-        cat "$TOKEN_FILE"
-        return
+    # A cached login token is reused until 5 minutes before it expires.
+    if jwt=$(secret_load token "$TOKEN_FILE" 2>/dev/null); then
+        exp=$(jwt_exp "$jwt")
+        if [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) + 300 )); then
+            printf '%s' "$jwt"
+            return
+        fi
     fi
-    local jwt
     jwt=$(do_login) || exit 1
-    ( umask 077; printf '%s' "$jwt" > "$TOKEN_FILE" )
+    printf '%s' "$jwt" | secret_save token "$TOKEN_FILE"
     printf '%s' "$jwt"
 }
 
@@ -109,25 +247,33 @@ api_call() {
     [[ -n "$data" ]] && body_args=(-H "Content-Type: application/json" --data "$data")
     for attempt in 1 2; do
         jwt=$(get_jwt) || return 1
+        # The header comes from a file descriptor, not argv: argv is world-readable in ps/proc,
+        # and an API key is valid for up to a year.
         resp=$(curl -sS -X "$method" -w '\n%{http_code}' \
-            -H "Authorization: Bearer $jwt" \
+            --proto =https --connect-timeout 15 --max-time 120 \
+            -H @<(printf 'Authorization: Bearer %s\n' "$jwt") \
             "${body_args[@]}" \
             "$URL$path")
         status="${resp##*$'\n'}"
         body="${resp%$'\n'*}"
+        # Never fall back to a SAML login from a portal token or an API key: that would log the
+        # web browser out.
+        if [[ "$status" == "401" || "$status" == "403" ]] && [[ -n "${PORTAL_JWT:-}" ]]; then
+            die "The portal rejected the browser token (HTTP $status): $(sanitize "$body")
+Copy a fresh cookie value right before pasting and retry."
+        fi
         if [[ "$status" == "401" ]] && using_apikey; then
-            # Don't fall back to a SAML login: that would log the web browser out.
-            die "API key rejected (HTTP 401). Create a new one with: isardvdi apikey create"
+            die "API key rejected (HTTP 401). Create a new one with: isardvdi apikey create --from-browser"
         fi
         if [[ "$status" == "401" && $attempt -eq 1 ]]; then
             err "JWT rejected — refreshing and retrying..."
-            rm -f "$TOKEN_FILE"
+            secret_clear token "$TOKEN_FILE"
             continue
         fi
         break
     done
     if [[ "$status" != 2* ]]; then
-        err "HTTP $status on $method $path: $body"
+        err "HTTP $status on $method $path: $(sanitize "$body")"
         return 1
     fi
     printf '%s' "$body"
@@ -157,7 +303,7 @@ match_one() {
         die "No $what matches \"$query\""
     elif [[ "$count" != "1" ]]; then
         err "Multiple ${what}s match \"$query\":"
-        printf '%s\n' "$matches" >&2
+        err "$(sanitize "$matches")"
         die "Be more specific (try the full name or the id)."
     fi
     printf '%s' "$matches" | cut -f1
@@ -197,7 +343,7 @@ wait_started() {
             return 0
         fi
         if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
-            printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$state" "$ip" >&2
+            printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$(sanitize "$state")" "$(sanitize "$ip")" >&2
             last_state="$state"
         fi
         sleep 1
@@ -214,7 +360,7 @@ wait_state_started() {
         state=$(desktop_detail_json "$id" | jq -r '.status')
         [[ "$state" == "Started" ]] && return 0
         if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
-            printf '  [%3ds/%ds] state=%s\n' "$elapsed" "$timeout" "$state" >&2
+            printf '  [%3ds/%ds] state=%s\n' "$elapsed" "$timeout" "$(sanitize "$state")" >&2
             last_state="$state"
         fi
         sleep 1
@@ -230,41 +376,45 @@ cmd_init() {
     read -rp "Corporate account (email, used to pick it at Microsoft) []: " username
     read -rp "Default SSH user on desktops [isard]: " ssh_user
     ssh_user="${ssh_user:-isard}"
+    url="${url%/}"
+    valid_url "$url" || die "The URL must look like https://host (no path): tokens are only sent over HTTPS."
 
-    mkdir -p "$CONF_DIR"
-    chmod 700 "$CONF_DIR"
-    (
-        umask 077
-        {
-            printf 'URL=%q\n' "$url"
-            printf 'USERNAME=%q\n' "$username"
-            printf 'SSH_USER=%q\n' "$ssh_user"
-        } > "$CONF_FILE"
-    )
+    {
+        printf 'URL=%q\n' "$url"
+        printf 'USERNAME=%q\n' "$username"
+        printf 'SSH_USER=%q\n' "$ssh_user"
+    } | write_secret "$CONF_FILE"
+    if secret_exists apikey "$APIKEY_FILE"; then
+        # A sign-in would log the web browser out, and the API key is used instead anyway.
+        echo "OK. Config saved to $CONF_FILE. Using the existing API key (no sign-in needed)."
+        return
+    fi
     echo "A browser window will open: sign in with your corporate account."
     echo "Accept 'Stay signed in' so later logins are silent. Do not close the window."
-    rm -f "$TOKEN_FILE"
+    secret_clear token "$TOKEN_FILE"
     URL="$url"; USERNAME="$username"
     jwt=$(sso_login --visible) \
         || die "Login failed; config kept at $CONF_FILE, retry with: isardvdi login"
-    ( umask 077; printf '%s' "$jwt" > "$TOKEN_FILE" )
+    printf '%s' "$jwt" | secret_save token "$TOKEN_FILE"
     echo "OK. Config saved to $CONF_FILE (no password is stored)."
 }
 
 cmd_login() {
     # Interactive sign-in in a visible browser (use when the silent refresh stopped working).
     load_config
-    rm -f "$TOKEN_FILE"
+    secret_exists apikey "$APIKEY_FILE" && die "The CLI uses an API key, so no sign-in is needed (it would only log
+your web browser out). See: isardvdi apikey status. To go back to sign-ins: isardvdi apikey revoke"
+    secret_clear token "$TOKEN_FILE"
     local jwt
     jwt=$(sso_login --visible) || exit 1
-    ( umask 077; printf '%s' "$jwt" > "$TOKEN_FILE" )
+    printf '%s' "$jwt" | secret_save token "$TOKEN_FILE"
     echo "Logged in."
 }
 
 cmd_list() {
-    list_desktops_json | jq -r '
+    list_desktops_json | jq -r "$JQ_CLEAN"'
         (["NAME","STATE","IP","ID"]),
-        (.[] | [.name, .status, (.ip // "-"), .id])
+        (.[] | [.name, .status, (.ip // "-"), .id] | map(clean))
         | @tsv' | column -t -s$'\t'
 }
 
@@ -340,7 +490,10 @@ cmd_ssh() {
         fi
     fi
 
-    if ! timeout 2 bash -c "</dev/tcp/$ip/22" 2>/dev/null; then
+    # The IP comes from the server: check it before it reaches a shell or ssh.
+    valid_ipv4 "$ip" || die "The server returned an invalid IP address: $(sanitize "$ip")"
+    # shellcheck disable=SC2016  # $1 expands in the child shell, as an argument, not as code
+    if ! timeout 2 bash -c '</dev/tcp/$1/22' _ "$ip" 2>/dev/null; then
         if vpn_iface_up; then
             die "Cannot reach $ip:22 — '$(vpn_iface)' interface is up locally, but the tunnel looks stale.
 IsardVDI invalidates the WireGuard peer when the web session expires. Refresh it:
@@ -355,7 +508,9 @@ Run: sudo wg-quick up $VPN_FILE"
     echo "Connecting to $ssh_user@$ip ..." >&2
     # DISPLAY="" forces ssh to prompt at the terminal instead of via a GUI
     # askpass helper, which on some desktops never surfaces and makes ssh look hung.
-    DISPLAY="" exec ssh "$ssh_user@$ip" "${args[@]}"
+    # HostKeyAlias pins the host key to the desktop, not to its VPN IP, which IsardVDI reuses
+    # between desktops: a changed key then really means a different machine.
+    DISPLAY="" exec ssh -o HostKeyAlias="isardvdi-$id" "$ssh_user@$ip" "${args[@]}"
 }
 
 _vpn_fetch() {
@@ -367,9 +522,33 @@ _vpn_fetch() {
     fi
     content=$(api_get "/api/v4/item/user/get-vpn")
     [[ "$content" == *"[Interface]"* ]] || die "Unexpected VPN config from server"
-    mkdir -p "$CONF_DIR"
-    chmod 700 "$CONF_DIR"
-    ( umask 077; printf '%s\n' "$content" > "$VPN_FILE" )
+    check_vpn_conf "$content"
+    printf '%s\n' "$content" | write_secret "$VPN_FILE"
+}
+
+check_vpn_conf() {
+    # The file is run by 'sudo wg-quick', which executes PreUp/PostUp/PreDown/PostDown as root
+    # shell commands. Accept only the settings IsardVDI puts in a user's config (it never sends
+    # hooks to users), so the server can't run commands on this machine or take its traffic.
+    local line key bad=""
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*\[(Interface|Peer)\][[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z]+)[[:space:]]*= ]]; then
+            key="${BASH_REMATCH[1]}"
+        else
+            key="?"
+        fi
+        case "$key" in
+            Address|PrivateKey|MTU|PublicKey|PresharedKey|Endpoint|PersistentKeepalive) ;;
+            AllowedIPs)
+                # A /0 route would send all of this machine's traffic through the server.
+                [[ "$line" =~ /0([[:space:]]*(,|$)) ]] && bad+=" AllowedIPs(default-route)" ;;
+            *) bad+=" $(sanitize "$key")" ;;
+        esac
+    done <<< "$1"
+    [[ -z "$bad" ]] || die "Refusing the VPN config from the server: unexpected setting(s):$bad
+(wg-quick would apply them as root). Nothing was written."
 }
 
 cmd_vpn_config() {
@@ -407,10 +586,10 @@ cmd_vpn_reload() {
 }
 
 cmd_deployments() {
-    list_deployments_json | jq -r '
+    list_deployments_json | jq -r "$JQ_CLEAN"'
         (["NAME","USERS","DESKTOPS","STARTED","ROLE","ID"]),
         (.[] | [.name, .total_users, .total_desktops, .started_desktops,
-                (if .co_owner then "co-owner" else "owner" end), .id])
+                (if .co_owner then "co-owner" else "owner" end), .id] | map(clean))
         | @tsv' | column -t -s$'\t'
 }
 
@@ -418,20 +597,38 @@ cmd_students() {
     [[ $# -ge 1 ]] || die "Usage: isardvdi students <deployment>"
     local dep
     dep=$(find_deployment "$1")
-    deployment_desktops_json "$dep" | jq -r '
+    deployment_desktops_json "$dep" | jq -r "$JQ_CLEAN"'
         (["STUDENT","GROUP","STATE","IP","DESKTOP ID"]),
         (sort_by(.user_name | ascii_downcase) | .[]
-         | [.user_name, .group_name, .status, (.ip // "-"), .id])
+         | [.user_name, .group_name, .status, (.ip // "-"), .id] | map(clean))
         | @tsv' | column -t -s$'\t'
 }
 
+# Viewer files come from the server, and IsardVDI's defaults share local devices with the guest
+# (RDP: printers, smartcards, clipboard). The guest may be controlled by someone else (a student),
+# so these filters turn every device redirection off. stdin → stdout; $1=1 allows the clipboard.
+harden_rdp() {
+    { grep -viE '^[[:space:]]*(redirect[a-z]+|[a-z]*storedirect|audiocapturemode)[[:space:]]*:' || true; }
+    printf '%s\n' redirectprinters:i:0 redirectcomports:i:0 redirectsmartcards:i:0 \
+        redirectposdevices:i:0 redirectdrives:i:0 redirectlocation:i:0 redirectwebauthn:i:0 \
+        drivestoredirect:s: devicestoredirect:s: usbdevicestoredirect:s: camerastoredirect:s: \
+        audiocapturemode:i:0 "redirectclipboard:i:$1"
+}
+
+harden_vv() {
+    # SPICE files can't control the clipboard; the caller handles it.
+    { grep -viE '^[[:space:]]*(enable-usbredir|enable-usb-autoshare|usb-filter|enable-smartcard)[[:space:]]*=' || true; } \
+        | sed '/^\[virt-viewer\]/a enable-usbredir=0\nenable-usb-autoshare=0\nenable-smartcard=0'
+}
+
 cmd_console() {
-    local no_start=0 viewer_type="file-spice" pos=()
+    local no_start=0 viewer_type="file-spice" clipboard="" pos=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-start) no_start=1 ;;
             --browser)  viewer_type="browser-vnc" ;;
             --rdp)      viewer_type="file-rdpgw" ;;
+            --clipboard) clipboard=1 ;;
             -*) die "Unknown flag: $1" ;;
             *) pos+=("$1") ;;
         esac
@@ -444,8 +641,14 @@ cmd_console() {
         2) local dep
            dep=$(find_deployment "${pos[0]}")
            id=$(deployment_desktops_json "$dep" | match_one "student desktop" "${pos[1]}" user_name) ;;
-        *) die "Usage: isardvdi console <desktop> | <deployment> <student> [--browser|--rdp] [--no-start]" ;;
+        *) die "Usage: isardvdi console <desktop> | <deployment> <student> [--browser|--rdp] [--clipboard] [--no-start]" ;;
     esac
+    # Someone else's desktop (a student's) is controlled by its user, who could read whatever you
+    # copy while the console is open: share the clipboard only with your own, unless asked.
+    if [[ -z "$clipboard" ]]; then
+        clipboard=0
+        list_desktops_json | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null && clipboard=1
+    fi
 
     local state
     state=$(desktop_detail_json "$id" | jq -r '.status')
@@ -498,6 +701,9 @@ networks in the web UI (desktop → Edit → Hardware), or use the SPICE console
         url=$(printf '%s' "$viewer" | jq -r '
             if (.viewer | test("[?&]cookie=")) then .viewer
             else .viewer + "?cookie=" + (.cookie | @uri) end')
+        # xdg-open launches whatever handles the URL's scheme: accept only plain https URLs.
+        [[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:][:cntrl:]]*)?$ ]] \
+            || die "Refusing the viewer URL from the server (not an https URL)."
         echo "Opening the browser viewer (you must be logged in to $URL in that browser)..." >&2
         xdg-open "$url" >/dev/null 2>&1 &
         return
@@ -505,15 +711,31 @@ networks in the web UI (desktop → Edit → Hardware), or use the SPICE console
 
     # File viewers: the file holds connection secrets (SPICE password; RDP gateway token and the
     # guest's credentials), so keep it private and delete it when the viewer exits.
-    local ext file
+    local ext dir file
     ext=$(printf '%s' "$viewer" | jq -r '.ext')
-    file=$(umask 077; mktemp --suffix=".$ext" "${XDG_RUNTIME_DIR:-$CONF_DIR}/isardvdi-console-XXXXXX")
-    trap "rm -f $(printf '%q' "$file")" EXIT   # expanded now: $file is local, gone at exit
-    printf '%s' "$viewer" | jq -r '.content' > "$file"
+    case "$viewer_type:$ext" in
+        file-spice:vv|file-rdpgw:rdp) ;;
+        *) die "Unexpected viewer file type from the server: $(sanitize "$ext")" ;;
+    esac
+    dir=$(umask 077; mktemp -d "${XDG_RUNTIME_DIR:-$CONF_DIR}/isardvdi-console-XXXXXX")
+    trap "rm -rf $(printf '%q' "$dir")" EXIT   # expanded now: $dir is local, gone at exit
+    file="$dir/console.$ext"
+    # The file's settings come from the server; strip every device redirection from them.
+    printf '%s' "$viewer" | jq -r '.content' | "harden_$ext" "$clipboard" > "$file"
+    if [[ $clipboard -eq 0 ]]; then
+        echo "Clipboard sharing is off for this desktop (not yours). Use --clipboard to enable it." >&2
+    fi
     if [[ "$viewer_type" == "file-spice" ]]; then
         require remote-viewer
+        local vconf="${XDG_CONFIG_HOME:-$HOME/.config}"
+        if [[ $clipboard -eq 0 ]]; then
+            # remote-viewer has no flag for this, only its settings file: use a private one.
+            vconf="$dir/config"
+            mkdir -p "$vconf/virt-viewer"
+            printf '[virt-viewer]\nshare-clipboard=false\n' > "$vconf/virt-viewer/settings"
+        fi
         echo "Opening SPICE console (close the window to return)..." >&2
-        remote-viewer "$file" || true
+        XDG_CONFIG_HOME="$vconf" remote-viewer --spice-disable-usbredir "$file" || true
         return
     fi
 
@@ -523,10 +745,12 @@ networks in the web UI (desktop → Edit → Hardware), or use the SPICE console
     done
     if [[ -n "$rdp" ]]; then
         # FreeRDP reads the gateway, its token and the guest credentials from the file; the
-        # flags only make the window resizable and share the clipboard. It runs in the
+        # flags make the window resizable and set clipboard sharing. It runs in the
         # foreground so you can answer its certificate prompt.
         echo "Opening RDP with $rdp (close the window to return)..." >&2
-        "$rdp" "$file" +dynamic-resolution /clipboard || true
+        local clip_flag=/clipboard
+        [[ $clipboard -eq 1 ]] || clip_flag=-clipboard
+        "$rdp" "$file" +dynamic-resolution "$clip_flag" || true
     elif command -v remmina >/dev/null 2>&1; then
         echo "Opening RDP with remmina (close the window to return)..." >&2
         remmina -c "$file" || true
@@ -535,45 +759,152 @@ networks in the web UI (desktop → Edit → Hardware), or use the SPICE console
     fi
 }
 
-fmt_epoch() { date -d "@$1" '+%F %R'; }
+fmt_epoch() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && date -d "@$1" '+%F %R' || echo "unknown"; }
+
+check_portal_token() {
+    # check_portal_token TOKEN [USER-ID]. Succeeds for a portal login token (not an API key) that
+    # is still valid, and of USER-ID if given; otherwise prints why to stderr and fails.
+    local payload exp
+    payload=$(jwt_payload "$1")
+    if [[ -z "$payload" ]]; then
+        err "That is not a token (expected a JWT: three parts separated by dots)."; return 1
+    fi
+    if ! printf '%s' "$payload" | jq -e '(.type // "login") == "login" and .session_id != "api-key"' >/dev/null; then
+        err "That is not a portal login token (an API key cannot create another API key)."; return 1
+    fi
+    exp=$(printf '%s' "$payload" | jq -r '.exp // 0')
+    if ! [[ "$exp" =~ ^[0-9]+$ && "$exp" -gt $(date +%s) ]]; then
+        err "That token has expired. Copy a fresh cookie value right before pasting."; return 1
+    fi
+    if [[ -n "${2:-}" && $(printf '%s' "$payload" | jq -r '.data.user_id // ""') != "$2" ]]; then
+        err "That token belongs to another IsardVDI user than the current API key."; return 1
+    fi
+}
+
+portal_user() { jwt_payload "$1" | jq -r '.data.name // .data.user_id // "?"'; }
+
+browser_portal_token() {
+    # browser_portal_token [USER-ID]. Stdout: the portal's login token, read from this computer's
+    # web browsers (lib/browser_token.py). Fails if no browser has a valid one: the portal only
+    # refreshes it while one of its tabs is open.
+    [[ -e "$BROWSER_HELPER" ]] || return 1
+    check_helper "$BROWSER_HELPER"
+    python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}"
+}
+
+read_portal_token() {
+    # Stdout: a login token copied from the web portal: from stdin if piped, else a hidden prompt.
+    local tkn
+    if [[ -t 0 ]]; then
+        err "In your web browser, logged in to $URL:"
+        err "  DevTools (F12) → Application (Firefox: Storage) → Cookies → $URL"
+        err "  copy the value of the 'isardvdi_session' cookie (or 'authorization')."
+        read -rsp "Paste it now (input hidden): " tkn || true
+        err ""
+    else
+        read -r tkn || true
+    fi
+    tkn="${tkn//[[:space:]]/}"
+    check_portal_token "$tkn" || exit 1
+    printf '%s' "$tkn"
+}
+
+new_apikey() {
+    # new_apikey DAYS. Stdout: a new API key. Creating one needs a login token (an API key is
+    # rejected): the browser's (PORTAL_JWT, no new session) or, with _ISARDVDI_LOGIN_TOKEN=1,
+    # a SAML login's, which logs the browser out.
+    local resp key
+    resp=$(api_call PUT "/authentication/api-key" "{\"expiration_minutes\": $(($1 * 24 * 60))}") || return 1
+    key=$(printf '%s' "$resp" | jq -r '.api_key // empty')
+    [[ -n "$key" ]] || { err "Unexpected response from server: $(sanitize "$resp")"; return 1; }
+    printf '%s' "$key"
+}
+
+store_apikey() {
+    printf '%s' "$1" | secret_save apikey "$APIKEY_FILE"
+    secret_clear token "$TOKEN_FILE"
+}
+
+apikey_auto_renew() {
+    # In the key's last RENEW_DAYS days, renew it with the portal session of this computer's
+    # browser: no sign-in, so the browser stays logged in. Tried at most once an hour, quietly:
+    # it only works while the portal is open in a browser.
+    secret_exists apikey "$APIKEY_FILE" || return 0
+    local exp uid tkn key
+    exp=$(apikey_exp)
+    [[ "$exp" =~ ^[0-9]+$ ]] && (( exp - $(date +%s) < RENEW_DAYS * 86400 )) || return 0
+    [[ -z $(find "$RENEW_STAMP" -mmin -60 2>/dev/null) ]] || return 0
+    : | write_secret "$RENEW_STAMP"
+    load_config
+    uid=$(jwt_payload "$(secret_load apikey "$APIKEY_FILE" || true)" | jq -r '.data.user_id // empty')
+    [[ -n "$uid" ]] || return 0
+    tkn=$(browser_portal_token "$uid" 2>/dev/null) || return 0
+    check_portal_token "$tkn" "$uid" 2>/dev/null || return 0
+    PORTAL_JWT="$tkn"
+    key=$(new_apikey "$KEY_DAYS" 2>/dev/null) || { unset PORTAL_JWT; return 0; }
+    unset PORTAL_JWT
+    store_apikey "$key"
+    err "Renewed the API key from your browser's portal session; valid until $(fmt_epoch "$(jwt_exp "$key")")."
+}
+
+apikey_expiry_warning() {
+    # Shown only when automatic renewal keeps failing (an expired key is reported by get_jwt).
+    secret_exists apikey "$APIKEY_FILE" || return 0
+    local exp
+    exp=$(apikey_exp)
+    [[ "$exp" =~ ^[0-9]+$ ]] || return 0
+    if (( exp > $(date +%s) && exp - $(date +%s) < WARN_DAYS * 86400 )); then
+        err "Note: the API key expires on $(fmt_epoch "$exp"). It renews itself while the portal is"
+        err "open in your web browser; or run: isardvdi apikey create --from-browser"
+    fi
+}
 
 cmd_apikey() {
     local sub="${1:-status}"
     [[ $# -gt 0 ]] && shift
     case "$sub" in
         create)
-            local days=365 resp key exp
-            if [[ "${1:-}" == "--days" ]]; then
-                [[ $# -ge 2 ]] || die "--days needs a number"
-                days="$2"
-            elif [[ $# -gt 0 ]]; then
-                die "Usage: isardvdi apikey create [--days N]"
-            fi
+            local days=$KEY_DAYS from_browser=0 key tkn
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --days) [[ $# -ge 2 ]] || die "--days needs a number"; days="$2"; shift 2 ;;
+                    --from-browser) from_browser=1; shift ;;
+                    *) die "Usage: isardvdi apikey create [--from-browser] [--days N]" ;;
+                esac
+            done
             [[ "$days" =~ ^[0-9]+$ && "$days" -ge 1 && "$days" -le 365 ]] \
                 || die "--days must be 1-365 (the server maximum is one year)"
-            # Creating a key needs a login token; this is the last SAML login (and browser logout).
-            resp=$(_ISARDVDI_LOGIN_TOKEN=1 api_call PUT "/authentication/api-key" \
-                "{\"expiration_minutes\": $((days * 24 * 60))}") || exit 1
-            key=$(printf '%s' "$resp" | jq -r '.api_key // empty')
-            [[ -n "$key" ]] || die "Unexpected response from server: $resp"
-            mkdir -p "$CONF_DIR"
-            chmod 700 "$CONF_DIR"
-            ( umask 077; printf '%s' "$key" > "$APIKEY_FILE" )
-            rm -f "$TOKEN_FILE"
-            exp=$(jwt_exp "$key")
-            echo "API key saved to $APIKEY_FILE (valid until $(fmt_epoch "$exp"))."
-            echo "The CLI no longer signs in, so it won't log your browser out."
+            if [[ $from_browser -eq 1 ]]; then
+                load_config
+                if [[ ! -t 0 ]]; then
+                    tkn=$(read_portal_token) || exit 1          # piped in: use exactly that
+                elif tkn=$(browser_portal_token 2>/dev/null) && check_portal_token "$tkn"; then
+                    err "Using the portal session of your web browser ($(portal_user "$tkn"))."
+                else
+                    err "No open portal session found in this computer's browsers."
+                    tkn=$(read_portal_token) || exit 1
+                    err "Token for: $(portal_user "$tkn")"
+                fi
+                PORTAL_JWT="$tkn"
+                key=$(new_apikey "$days") || exit 1
+                unset PORTAL_JWT
+            else
+                key=$(_ISARDVDI_LOGIN_TOKEN=1 new_apikey "$days") || exit 1
+            fi
+            store_apikey "$key"
+            echo "API key saved in $(secret_where apikey "$APIKEY_FILE"); valid until $(fmt_epoch "$(jwt_exp "$key")")."
+            echo "The CLI no longer signs in, so it won't log your browser out. In its last"
+            echo "$RENEW_DAYS days it renews itself whenever the portal is open in your browser."
             ;;
         status)
             load_config
-            if [[ ! -f "$APIKEY_FILE" ]]; then
+            if ! secret_exists apikey "$APIKEY_FILE"; then
                 echo "No API key: using SAML login sessions (each one logs your browser out)."
-                echo "Create one with: isardvdi apikey create"
+                echo "Create one with: isardvdi apikey create --from-browser"
                 return
             fi
-            local exp server
-            exp=$(jwt_exp "$(cat "$APIKEY_FILE")")
-            echo "Local key:  $APIKEY_FILE, expires $(fmt_epoch "$exp")"
+            local server
+            echo "Local key:  in $(secret_where apikey "$APIKEY_FILE"), expires $(fmt_epoch "$(apikey_exp)")"
             server=$(api_get "/api/v4/item/user/get-api-key") || exit 1
             if [[ $(printf '%s' "$server" | jq -r '.exists') == "true" ]]; then
                 echo "Server key: expires $(fmt_epoch "$(printf '%s' "$server" | jq -r '.expires')")"
@@ -581,16 +912,47 @@ cmd_apikey() {
                 echo "Server key: none on record"
             fi
             ;;
+        print)
+            # For scripts that call the API themselves: ISARD_KEY=$(isardvdi apikey print)
+            secret_exists apikey "$APIKEY_FILE" || die "No API key on this computer."
+            [[ ! -t 1 ]] || die "Refusing to print the key on the terminal; use it as \$(isardvdi apikey print)."
+            secret_load apikey "$APIKEY_FILE" || die "The keyring can't be read now (locked, or no desktop session)."
+            ;;
         revoke|delete)
-            [[ -f "$APIKEY_FILE" ]] || die "No API key at $APIKEY_FILE"
-            api_call DELETE "/api/v4/item/user/expire-api-key" >/dev/null || true
-            rm -f "$APIKEY_FILE"
-            echo "Deleted $APIKEY_FILE and the server's record of it. Back to SAML login sessions."
+            secret_exists apikey "$APIKEY_FILE" || die "No API key on this computer."
+            local server_ok=1
+            if apikey_expired; then
+                server_ok=2   # the server's record has expired too, and the key can't authenticate
+            else
+                # Subshell: api_call dies on a rejected key, which must not skip the local delete.
+                ( api_call DELETE "/api/v4/item/user/expire-api-key" >/dev/null ) || server_ok=0
+            fi
+            secret_clear apikey "$APIKEY_FILE"
+            if [[ $server_ok -eq 1 ]]; then
+                echo "Deleted the API key and the server's record of it. Back to SAML login sessions."
+            elif [[ $server_ok -eq 2 ]]; then
+                echo "Deleted the expired API key. Back to SAML login sessions."
+            else
+                echo "Deleted the API key, but the server's record could not be removed (see above)."
+            fi
             echo "Note: IsardVDI does not check keys against that record, so a copy of the key"
             echo "keeps working until it expires."
             ;;
-        *) die "Usage: isardvdi apikey [create [--days N] | status | revoke]" ;;
+        *) die "Usage: isardvdi apikey [create [--from-browser] [--days N] | status | print | revoke]" ;;
     esac
+}
+
+cmd_forget() {
+    # Remove every secret this tool keeps on this computer, e.g. before leaving a shared one.
+    if [[ -f "$VPN_FILE" ]] && vpn_iface_up; then
+        die "The VPN tunnel is up and needs $VPN_FILE to come down. First run: sudo wg-quick down $VPN_FILE"
+    fi
+    ! secret_exists apikey "$APIKEY_FILE" || cmd_apikey revoke
+    secret_clear token "$TOKEN_FILE"
+    rm -f "$VPN_FILE" "$RENEW_STAMP"
+    rm -rf "$PROFILE_DIR"
+    echo "Removed the cached token, the VPN config and the saved Microsoft sign-in."
+    echo "Kept $CONF_FILE (URL and account name only)."
 }
 
 cmd_help() {
@@ -606,6 +968,7 @@ COMMANDS
                                     No password is stored.
     login                           Interactive browser sign-in (when the silent refresh
                                     stops working, e.g. Microsoft asks for the password).
+                                    Refused while an API key is in use.
     list                            List your desktops (name, state, IP, id).
     status <name|id>                Show one desktop's details as JSON.
     start  <name|id>                Start a desktop and wait until it reaches state
@@ -627,7 +990,7 @@ COMMANDS
     deployments                     List the deployments you own or co-own.
     students <deployment>           List a deployment's desktops: student, group, state,
                                     IP, desktop id.
-    console <desktop> | <deployment> <student> [--browser|--rdp] [--no-start]
+    console <desktop> | <deployment> <student> [--browser|--rdp] [--clipboard] [--no-start]
                                     Open a desktop's console, auto-starting it if needed.
                                     Works for your students' desktops too. Default:
                                     SPICE in remote-viewer (virt-viewer package).
@@ -635,13 +998,28 @@ COMMANDS
                                     logged in to the portal there). --rdp: RDP through
                                     IsardVDI's gateway with FreeRDP (freerdp3-x11) or
                                     Remmina; the desktop needs RDP enabled and its
-                                    WireGuard interface.
-    apikey create [--days N]        Create an API key (default and max 365 days) and use
+                                    WireGuard interface. USB devices, drives, printers
+                                    and smartcards are never shared with the desktop.
+                                    The clipboard is shared only with your own desktops;
+                                    --clipboard shares it with a student's too (they
+                                    could then read what you copy).
+    apikey create [--from-browser] [--days N]
+                                    Create an API key (default 90 days, max 365) and use
                                     it instead of SAML logins. IsardVDI allows one login
                                     session per user, so every CLI login logs your web
-                                    browser out; an API key doesn't.
+                                    browser out; an API key doesn't. --from-browser:
+                                    use the portal session of this computer's web browser
+                                    (open the portal first) instead of signing in, so the
+                                    browser stays logged in; if none is found, paste the
+                                    session cookie. In its last 30 days the key renews
+                                    itself the same way whenever the portal is open.
     apikey status                   Show the local key's and the server's key expiry.
+    apikey print                    Write the key to stdout, for scripts that call the API
+                                    themselves: ISARD_KEY=\$(isardvdi apikey print)
     apikey revoke                   Delete the local key and the server's record of it.
+    forget                          Delete every secret stored on this computer (API key,
+                                    token, VPN config, saved Microsoft sign-in). Use it
+                                    before leaving a shared computer.
     help, -h, --help                This help.
 
 DESKTOP NAME MATCHING
@@ -664,15 +1042,15 @@ FILES
         URL, USERNAME (account hint), SSH_USER. Mode 600.
     $PROFILE_DIR
         Browser profile holding the Microsoft single sign-on, so the JWT refreshes
-        without a password. Treat it like a saved login; delete it to sign out.
-    $TOKEN_FILE
-        Cached JWT, auto-refreshed (TTL 30 min, refreshed at 25 min, plus
-        transparent retry on HTTP 401). Refresh = silent headless SAML login.
-        Not used while an API key exists.
-    $APIKEY_FILE
-        API key (JWT, valid up to a year). Mode 600. IsardVDI does not check it
-        against the server's record, so it keeps working until it expires even
-        after 'apikey revoke' — treat it as a secret.
+        without a password. It can sign in to your whole Microsoft account, not only
+        IsardVDI: treat it like a saved password ('isardvdi forget' deletes it).
+    API key and login token
+        Kept in the system keyring (Secret Service: GNOME Keyring, KWallet) when
+        there is one, else in $APIKEY_FILE and $TOKEN_FILE (mode 600).
+        The token is a cached SAML login, refreshed 5 minutes before it expires
+        and not used while an API key exists. IsardVDI does not check API keys
+        against the server's record, so a key keeps working until it expires
+        even after 'apikey revoke' — treat it as a secret.
     $VPN_FILE
         WireGuard config (\`Address\`, \`PrivateKey\`, peer info). Mode 600.
         This file contains a private key — treat it as a secret.
@@ -698,6 +1076,15 @@ EOF
 cmd="${1:-help}"
 if [[ $# -gt 0 ]]; then shift; fi
 case "$cmd" in
+    help|-h|--help) ;;
+    *)  secure_conf
+        migrate_secrets
+        case "$cmd" in
+            init|login|apikey|api-key|forget) ;;
+            *) apikey_auto_renew; apikey_expiry_warning ;;
+        esac ;;
+esac
+case "$cmd" in
     init)            cmd_init "$@" ;;
     login)           cmd_login "$@" ;;
     list|ls)         cmd_list "$@" ;;
@@ -711,6 +1098,7 @@ case "$cmd" in
     students)        cmd_students "$@" ;;
     console|viewer)  cmd_console "$@" ;;
     apikey|api-key)  cmd_apikey "$@" ;;
+    forget)          cmd_forget "$@" ;;
     help|-h|--help)  cmd_help ;;
     *) err "Unknown command: $cmd"; cmd_help; exit 1 ;;
 esac
