@@ -8,8 +8,8 @@ login session per user).
 
 Supported: Firefox (cookies are stored in clear) and Chromium-based browsers (Chrome, Chromium,
 Vivaldi, Brave, Edge), whose cookies are encrypted with a key kept in KWallet or the Secret
-Service keyring. Only the portal's cookies are read and decrypted. KWallet may ask once whether
-to allow "isardvdi-cli" to read the browser's key.
+Service keyring. Under WSL, also the Windows user's Firefox. Only the portal's cookies are read
+and decrypted. KWallet may ask once whether to allow "isardvdi-cli" to read the browser's key.
 
 Exit codes: 0 found, 1 no valid token in any browser (the portal may not be open: the browser
 only refreshes the token while a portal tab is open), 2 usage error.
@@ -92,8 +92,27 @@ def rows(db_path, wal_suffixes, sql, args):
             con.close()
 
 
+def windows_firefox_dirs():
+    """Under WSL, the Windows user's Firefox profiles (Firefox doesn't encrypt cookies; Chrome and
+    Edge on Windows do, with a key Linux can't use, and lock the file). Best effort: Firefox may
+    hold the file locked too."""
+    if not (os.environ.get("WSL_DISTRO_NAME") or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")):
+        return []
+    try:
+        cwd = "/mnt/c" if os.path.isdir("/mnt/c") else None  # cmd.exe refuses a Linux cwd
+        appdata = subprocess.run(["cmd.exe", "/d", "/c", "echo %APPDATA%"], cwd=cwd,
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+        if not appdata or "%" in appdata:
+            return []
+        path = subprocess.run(["wslpath", "-u", appdata], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [os.path.join(path, "Mozilla", "Firefox", "Profiles")] if path else []
+
+
 def firefox_tokens(hosts):
-    for d in FIREFOX_DIRS:
+    for d in FIREFOX_DIRS + windows_firefox_dirs():
         for db in glob.glob(os.path.join(d, "*", "cookies.sqlite")):
             try:
                 found, _ = rows(db, ("-wal",),

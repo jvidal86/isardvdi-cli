@@ -61,14 +61,22 @@ python3 -c 'import cryptography' 2>/dev/null \
     || info "recommended: python3-cryptography, to renew the API key from Chrome/Chromium/Vivaldi/Brave/Edge"
 
 if have python3 && ! python3 -c 'import playwright' 2>/dev/null; then
+    # pip >= 23 (Ubuntu 24.04+) refuses --user installs without --break-system-packages;
+    # older pip (Ubuntu 22.04) doesn't know that flag.
+    pip_flags="--user"
+    python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
+        && pip_flags="--user --break-system-packages"
     if [ "${ISARDVDI_INSTALL_DEPS:-0}" = "1" ]; then
+        python3 -m pip --version >/dev/null 2>&1 \
+            || err "pip is missing: sudo apt install python3-pip, then re-run this installer"
         info "installing Playwright + Chromium for the current user"
-        python3 -m pip install --user --break-system-packages playwright \
-            || err "pip install playwright failed"
+        # shellcheck disable=SC2086  # two separate flags
+        python3 -m pip install $pip_flags playwright || err "pip install playwright failed"
         python3 -m playwright install chromium || err "playwright install chromium failed"
+        info "if the sign-in browser fails to start (fresh Ubuntu/WSL): python3 -m playwright install-deps chromium (asks for sudo)"
     else
         info "Python 'playwright' not found. Install it with:"
-        info "    python3 -m pip install --user --break-system-packages playwright && python3 -m playwright install chromium"
+        info "    python3 -m pip install $pip_flags playwright && python3 -m playwright install chromium"
         info "or re-run this installer with ISARDVDI_INSTALL_DEPS=1"
     fi
 fi

@@ -56,11 +56,31 @@ Chromium-based browsers (Chrome, Chromium, Vivaldi, Brave, Edge) are read automa
 cookie key comes from KWallet or the Secret Service, and KWallet may ask once whether to allow
 `isardvdi-cli`. Only the portal's cookie is read. If no session is found, the CLI asks you to paste
 the cookie: DevTools (F12) → Application (Firefox: Storage) → Cookies → the portal, value of
-`isardvdi_session` (or `authorization`).
+`isardvdi_session` (or `authorization`). Easier: add this bookmark once (any name, e.g.
+*IsardVDI session*); clicking it on a portal page copies the session to the clipboard:
+
+```
+javascript:(()=>{const m=document.cookie.match(/(?:^|;\s*)(?:isardvdi_session|authorization)=([^;]+)/);if(!m){alert('Log in to the IsardVDI portal first, then click this bookmark on a portal page.');return}const t=decodeURIComponent(m[1]);navigator.clipboard.writeText(t).then(()=>alert('IsardVDI session copied. In the terminal run:  isardvdi apikey create --from-browser  and paste it.'),()=>prompt('Copy this (Ctrl+C), then run: isardvdi apikey create --from-browser',t))})()
+```
 
 From then on the CLI only uses the key, which it keeps in the system keyring. In the key's last 30
 days it renews itself the same way, at most once an hour, whenever the portal is open in your
 browser. It only reminds you if that keeps failing for two weeks.
+
+### WSL and Ubuntu 22.04
+
+Everything works under WSL (tested with Ubuntu 22.04's jq, curl, Python and FreeRDP 2), with two
+differences:
+
+- **No keyring** unless you set one up: the API key is kept in `~/.config/isardvdi-cli/apikey`
+  (mode 600, inside the Linux filesystem).
+- **Renewal from a Windows browser:** the key renews itself only from the Windows **Firefox**
+  (best effort). Chrome and Edge on Windows lock their cookie file and encrypt it with a key Linux
+  can't use, so with them, when the reminder appears (last 14 days), click the bookmark above on the
+  portal and run `isardvdi apikey create --from-browser`, then paste.
+
+The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its browser window, and
+`python3 -m playwright install-deps chromium` (it asks for sudo) once on a fresh Ubuntu.
 
 ## Commands
 
