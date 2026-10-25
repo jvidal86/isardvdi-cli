@@ -63,6 +63,9 @@ the cookie: DevTools (F12) → Application (Firefox: Storage) → Cookies → th
 javascript:(()=>{const m=document.cookie.match(/(?:^|;\s*)(?:isardvdi_session|authorization)=([^;]+)/);if(!m){alert('Log in to the IsardVDI portal first, then click this bookmark on a portal page.');return}const t=decodeURIComponent(m[1]);navigator.clipboard.writeText(t).then(()=>alert('IsardVDI session copied. In the terminal run:  isardvdi apikey create --from-browser  and paste it.'),()=>prompt('Copy this (Ctrl+C), then run: isardvdi apikey create --from-browser',t))})()
 ```
 
+The session then stays in your clipboard, and in clipboard history tools such as Klipper, until
+you copy something else: copy something else after pasting it.
+
 From then on the CLI only uses the key, which it keeps in the system keyring. In the key's last 30
 days it renews itself the same way, at most once an hour, whenever the portal is open in your
 browser. It only reminds you if that keeps failing for two weeks.
@@ -144,7 +147,8 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
   why keys last 90 days and renew themselves. Prefer a shorter `--days` on shared machines.
 - **What comes from the server is checked before use.** Before `sudo wg-quick` runs the VPN
   config as root, the CLI refuses any setting IsardVDI doesn't send to users (`PostUp` and other
-  command hooks, `DNS`, a route for all traffic). IP addresses, viewer URLs and viewer file types
+  command hooks, `DNS`, and any route that isn't a private IPv4 network of /16 or smaller, which
+  also blocks a disguised default route such as `0.0.0.0/1, 128.0.0.0/1`). IP addresses, viewer URLs and viewer file types
   are validated, and names are stripped of terminal control characters before printing.
 - **Consoles share no local devices.** IsardVDI's default RDP file shares your printers, smartcards
   and clipboard with the desktop, and a student controls their own desktop. `console` turns off

@@ -20,7 +20,8 @@ START_TIMEOUT="${ISARDVDI_START_TIMEOUT:-180}"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 # Set only by 'apikey create --from-browser'. Unset first so an inherited (exported) value is
 # never used, and the plain assignment later stays out of child processes' environments.
-unset PORTAL_JWT
+# _ISARDVDI_LOGIN_TOKEN is internal too: inherited, it would force a SAML login.
+unset PORTAL_JWT _ISARDVDI_LOGIN_TOKEN
 
 err() { printf '%s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
@@ -32,7 +33,7 @@ require python3
 
 # Server data is untrusted on the way to the terminal: strip control characters (escape
 # sequences can rewrite the screen, set the clipboard, ...). JQ_CLEAN is the same for jq output.
-sanitize() { printf '%s' "$*" | tr -d '\000-\010\013-\037\177'; }
+sanitize() { printf '%s' "$*" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g'; }
 JQ_CLEAN='def clean: tostring | gsub("\\p{Cc}"; "?");'
 
 valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; }
@@ -73,10 +74,12 @@ write_secret() {
 # when there is one, else in a private file. "<file>.in-keyring" (it holds no secret) records
 # that the keyring has it, so a locked or unreachable keyring is an error instead of "no key",
 # which would fall back to a sign-in and log the web browser out.
-keyring_ok() {
+keyring_ok() { [[ "${ISARDVDI_KEYRING:-1}" != 0 ]] && keyring_running; }   # store secrets there?
+
+keyring_running() {
     # Use only a keyring service that is already running. Asking a session without one (WSL,
     # servers) starts a keyring daemon that waits for an unlock nobody sees: every command hangs.
-    [[ "${ISARDVDI_KEYRING:-1}" != 0 && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
     command -v secret-tool >/dev/null 2>&1 || return 1
     if command -v gdbus >/dev/null 2>&1; then
         [[ $(timeout 5 gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
@@ -97,7 +100,7 @@ secret_load() {
     # has it but can't be read.
     local v
     if [[ -f "$2.in-keyring" ]]; then
-        keyring_ok || return 2
+        keyring_running || return 2
         v=$(keyring lookup service isardvdi-cli item "$1") && [[ -n "$v" ]] || return 2
         printf '%s' "$v"
     elif [[ -f "$2" ]]; then
@@ -117,6 +120,10 @@ secret_save() {
         rm -f "$2"
         : | write_secret "$2.in-keyring"
     else
+        # An older copy may still be in the keyring: remove it, or forget/revoke would miss it.
+        if [[ -f "$2.in-keyring" ]] && ! { keyring_running && keyring clear service isardvdi-cli item "$1"; }; then
+            err "Note: an older '$1' may remain in the keyring (item 'isardvdi-cli $1')."
+        fi
         printf '%s' "$v" | write_secret "$2"
         rm -f "$2.in-keyring"
     fi
@@ -124,7 +131,7 @@ secret_save() {
 
 secret_clear() {
     # secret_clear NAME FILE
-    if [[ -f "$2.in-keyring" ]] && ! { keyring_ok && keyring clear service isardvdi-cli item "$1"; }; then
+    if [[ -f "$2.in-keyring" ]] && ! { keyring_running && keyring clear service isardvdi-cli item "$1"; }; then
         err "Could not remove '$1' from the keyring (is it locked?). Remove the item"
         err "'isardvdi-cli $1' with your keyring manager."
     fi
@@ -210,8 +217,12 @@ jwt_payload() {
 }
 
 jwt_exp() {
-    # Stdout: the "exp" claim (epoch seconds) of a JWT, or nothing if it can't be decoded.
-    jwt_payload "$1" | jq -r '.exp // empty'
+    # Stdout: the "exp" claim (epoch seconds) of a JWT as an integer, or nothing. Never pass a
+    # claim to bash arithmetic unchecked: [[ x -le y ]] evaluates x as code ("a[$(cmd)]" runs cmd).
+    local exp
+    exp=$(jwt_payload "$1" | jq -r '.exp | numbers | floor' 2>/dev/null || true)
+    [[ "$exp" =~ ^[0-9]{1,12}$ ]] && printf '%s' "$exp"
+    return 0
 }
 
 # An API key has its own pseudo-session ("api-key"), so using it never creates or revokes a
@@ -219,7 +230,7 @@ jwt_exp() {
 # _ISARDVDI_LOGIN_TOKEN=1 forces the login token (needed to create an API key).
 using_apikey() { [[ -z "${_ISARDVDI_LOGIN_TOKEN:-}" ]] && secret_exists apikey "$APIKEY_FILE"; }
 apikey_exp() { jwt_exp "$(secret_load apikey "$APIKEY_FILE" || true)"; }
-apikey_expired() { local exp; exp=$(apikey_exp); [[ -n "$exp" && "$exp" -le $(date +%s) ]]; }
+apikey_expired() { local exp; exp=$(apikey_exp); [[ "$exp" =~ ^[0-9]+$ ]] && (( exp <= $(date +%s) )); }
 
 get_jwt() {
     load_config
@@ -233,7 +244,9 @@ get_jwt() {
             || die "The API key is in the system keyring, which can't be read now (locked, or no
 desktop session, e.g. over SSH). Unlock the keyring, or run this from your desktop session."
         exp=$(jwt_exp "$jwt")
-        if [[ -n "$exp" && "$exp" -le $(date +%s) ]]; then
+        [[ "$exp" =~ ^[0-9]+$ ]] || die "The stored API key is not valid (no expiry date). Open the portal in
+your browser and run: isardvdi apikey create --from-browser"
+        if (( exp <= $(date +%s) )); then
             die "API key expired on $(fmt_epoch "$exp"). Open the portal in your browser, then run:
     isardvdi apikey create --from-browser
 (or 'isardvdi apikey revoke' to go back to SAML sign-ins)"
@@ -266,7 +279,7 @@ api_call() {
         # The header comes from a file descriptor, not argv: argv is world-readable in ps/proc,
         # and an API key is valid for up to a year.
         resp=$(curl -sS -X "$method" -w '\n%{http_code}' \
-            --proto =https --connect-timeout 15 --max-time 120 \
+            --proto =https --connect-timeout 15 --max-time 120 --globoff \
             -H @<(printf 'Authorization: Bearer %s\n' "$jwt") \
             "${body_args[@]}" \
             "$URL$path")
@@ -312,8 +325,8 @@ match_one() {
     local what="$1" query="$2" field="$3" matches count
     matches=$(jq -r --arg q "$query" --arg f "$field" '
         .[]
-        | select(.[$f] // "" | ascii_downcase | contains($q | ascii_downcase))
-        | [.id, .[$f]] | @tsv')
+        | select(.[$f] // "" | tostring | ascii_downcase | contains($q | ascii_downcase))
+        | [.id, .[$f]] | map(tostring) | @tsv')
     count=$(printf '%s' "$matches" | grep -c . || true)
     if [[ "$count" == "0" ]]; then
         die "No $what matches \"$query\""
@@ -322,7 +335,11 @@ match_one() {
         err "$(sanitize "$matches")"
         die "Be more specific (try the full name or the id)."
     fi
-    printf '%s' "$matches" | cut -f1
+    local id
+    id=$(printf '%s' "$matches" | cut -f1)
+    # The id goes into URLs, ssh options and messages: accept only a UUID.
+    [[ "$id" =~ $UUID_RE ]] || die "The server returned an invalid $what id: $(sanitize "$id")"
+    printf '%s' "$id"
 }
 
 find_desktop() {
@@ -343,6 +360,14 @@ find_deployment() {
     list_deployments_json | match_one deployment "$query" name
 }
 
+# Server fields on their way in: the state is shown to the user, the IP reaches a shell and ssh.
+desktop_state() { printf '%s' "$1" | jq -r "$JQ_CLEAN"' .status // "unknown" | clean' 2>/dev/null || echo unknown; }
+desktop_ip() {
+    local ip
+    ip=$(printf '%s' "$1" | jq -r '.ip // "null" | tostring' 2>/dev/null || echo null)
+    if valid_ipv4 "$ip"; then printf '%s' "$ip"; else echo null; fi
+}
+
 vpn_iface() { basename "$VPN_FILE" .conf; }
 vpn_iface_up() { ip link show "$(vpn_iface)" >/dev/null 2>&1; }
 
@@ -351,15 +376,16 @@ wait_started() {
     # Prints a heartbeat to stderr every 10 s so the user knows it's still alive.
     local id="$1" timeout="${2:-60}" elapsed=0 d state ip last_state=""
     while [[ $elapsed -lt $timeout ]]; do
-        d=$(desktop_from_list "$id")
-        state=$(printf '%s' "$d" | jq -r '.status')
-        ip=$(printf '%s' "$d" | jq -r '.ip // "null"')
+        # One failed request (network blip, server restart) must not end the wait.
+        d=$(desktop_from_list "$id" 2>/dev/null) || d=""
+        state=$(desktop_state "$d")
+        ip=$(desktop_ip "$d")
         if [[ "$state" == "Started" && "$ip" != "null" ]]; then
             printf '%s' "$ip"
             return 0
         fi
         if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
-            printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$(sanitize "$state")" "$(sanitize "$ip")" >&2
+            printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$state" "$ip" >&2
             last_state="$state"
         fi
         sleep 1
@@ -373,10 +399,10 @@ wait_state_started() {
     # needed) and uses get-info, which also works for students' desktops in your deployments.
     local id="$1" timeout="${2:-60}" elapsed=0 state last_state=""
     while [[ $elapsed -lt $timeout ]]; do
-        state=$(desktop_detail_json "$id" | jq -r '.status')
+        state=$(desktop_state "$(desktop_detail_json "$id" 2>/dev/null || true)")
         [[ "$state" == "Started" ]] && return 0
         if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
-            printf '  [%3ds/%ds] state=%s\n' "$elapsed" "$timeout" "$(sanitize "$state")" >&2
+            printf '  [%3ds/%ds] state=%s\n' "$elapsed" "$timeout" "$state" >&2
             last_state="$state"
         fi
         sleep 1
@@ -485,8 +511,8 @@ cmd_ssh() {
     local id d state ip
     id=$(find_desktop "$target")
     d=$(desktop_from_list "$id")
-    state=$(printf '%s' "$d" | jq -r '.status')
-    ip=$(printf '%s' "$d" | jq -r '.ip // "null"')
+    state=$(desktop_state "$d")
+    ip=$(desktop_ip "$d")
 
     if [[ "$state" != "Started" || "$ip" == "null" ]]; then
         if [[ $no_start -eq 1 ]]; then
@@ -526,7 +552,9 @@ Run: sudo wg-quick up $VPN_FILE"
     # askpass helper, which on some desktops never surfaces and makes ssh look hung.
     # HostKeyAlias pins the host key to the desktop, not to its VPN IP, which IsardVDI reuses
     # between desktops: a changed key then really means a different machine.
-    DISPLAY="" exec ssh -o HostKeyAlias="isardvdi-$id" "$ssh_user@$ip" "${args[@]}"
+    # ForwardAgent/ForwardX11=no override a "Host *" in ~/.ssh/config (-A or -X still can).
+    DISPLAY="" exec ssh -o HostKeyAlias="isardvdi-$id" -o ForwardAgent=no -o ForwardX11=no \
+        "$ssh_user@$ip" "${args[@]}"
 }
 
 _vpn_fetch() {
@@ -540,6 +568,22 @@ _vpn_fetch() {
     [[ "$content" == *"[Interface]"* ]] || die "Unexpected VPN config from server"
     check_vpn_conf "$content"
     printf '%s\n' "$content" | write_secret "$VPN_FILE"
+}
+
+allowed_ips_ok() {
+    # Each route must be an IPv4 network inside 10/8, 172.16/12 or 192.168/16 with a prefix of /16
+    # or longer. Anything wider (0.0.0.0/1 + 128.0.0.0/1 is a default route in disguise) or public,
+    # or any IPv6, would let the server take traffic that isn't meant for IsardVDI.
+    local net a b nets
+    IFS=',' read -ra nets <<< "$1"
+    for net in "${nets[@]}"; do
+        net="${net//[[:space:]]/}"
+        [[ "$net" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}/([0-9]{1,2})$ ]] || return 1
+        a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+        (( 10#${BASH_REMATCH[3]} >= 16 && 10#${BASH_REMATCH[3]} <= 32 )) || return 1
+        (( a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) )) || return 1
+    done
+    [[ ${#nets[@]} -gt 0 ]]
 }
 
 check_vpn_conf() {
@@ -557,9 +601,7 @@ check_vpn_conf() {
         fi
         case "$key" in
             Address|PrivateKey|MTU|PublicKey|PresharedKey|Endpoint|PersistentKeepalive) ;;
-            AllowedIPs)
-                # A /0 route would send all of this machine's traffic through the server.
-                [[ "$line" =~ /0([[:space:]]*(,|$)) ]] && bad+=" AllowedIPs(default-route)" ;;
+            AllowedIPs) allowed_ips_ok "${line#*=}" || bad+=" AllowedIPs(not-a-private-/16-or-smaller)" ;;
             *) bad+=" $(sanitize "$key")" ;;
         esac
     done <<< "$1"
@@ -615,7 +657,7 @@ cmd_students() {
     dep=$(find_deployment "$1")
     deployment_desktops_json "$dep" | jq -r "$JQ_CLEAN"'
         (["STUDENT","GROUP","STATE","IP","DESKTOP ID"]),
-        (sort_by(.user_name | ascii_downcase) | .[]
+        (sort_by(.user_name // "" | tostring | ascii_downcase) | .[]
          | [.user_name, .group_name, .status, (.ip // "-"), .id] | map(clean))
         | @tsv' | column -t -s$'\t'
 }
@@ -624,7 +666,9 @@ cmd_students() {
 # (RDP: printers, smartcards, clipboard). The guest may be controlled by someone else (a student),
 # so these filters turn every device redirection off. stdin → stdout; $1=1 allows the clipboard.
 harden_rdp() {
-    { grep -viE '^[[:space:]]*(redirect[a-z]+|[a-z]*storedirect|audiocapturemode)[[:space:]]*:' || true; }
+    # Only "name:type:value" lines: FreeRDP can also take command-line options (/drive:...) from
+    # the file. Then drop every redirection the server set and add our own.
+    { grep -E '^[A-Za-z][A-Za-z0-9 ]*:[isb]:' | grep -viE '^(redirect[a-z]+|[a-z]*storedirect|audiocapturemode)[[:space:]]*:' || true; }
     printf '%s\n' redirectprinters:i:0 redirectcomports:i:0 redirectsmartcards:i:0 \
         redirectposdevices:i:0 redirectdrives:i:0 redirectlocation:i:0 redirectwebauthn:i:0 \
         drivestoredirect:s: devicestoredirect:s: usbdevicestoredirect:s: camerastoredirect:s: \
@@ -667,7 +711,7 @@ cmd_console() {
     fi
 
     local state
-    state=$(desktop_detail_json "$id" | jq -r '.status')
+    state=$(desktop_state "$(desktop_detail_json "$id")")
     if [[ "$state" != "Started" ]]; then
         [[ $no_start -eq 0 ]] || die "Desktop not Started (state=$state). --no-start requested, refusing to start."
         case "$state" in
@@ -797,16 +841,19 @@ check_portal_token() {
     fi
 }
 
-portal_user() { jwt_payload "$1" | jq -r '.data.name // .data.user_id // "?"'; }
+portal_user() { jwt_payload "$1" | jq -r "$JQ_CLEAN"' .data.name // .data.user_id // "?" | clean'; }
 
 browser_portal_token() {
-    # browser_portal_token [USER-ID]. Stdout: the portal's login token, read from this computer's
-    # web browsers (lib/browser_token.py). Fails if no browser has a valid one: the portal only
-    # refreshes it while one of its tabs is open.
+    # browser_portal_token [USER-ID [SECONDS]]. Stdout: the portal's login token, read from this
+    # computer's web browsers (lib/browser_token.py). Fails if no browser has a valid one (the
+    # portal only refreshes it while one of its tabs is open), or, without USER-ID, if several
+    # accounts are logged in (exit 3). SECONDS caps the time (keyring prompts included).
     [[ -e "$BROWSER_HELPER" ]] || return 1
     check_helper "$BROWSER_HELPER"
-    python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}"
+    timeout "${2:-300}" python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}"
 }
+
+apikey_user_id() { jwt_payload "$(secret_load apikey "$APIKEY_FILE" 2>/dev/null || true)" | jq -r '.data.user_id // empty'; }
 
 read_portal_token() {
     # Stdout: a login token copied from the web portal: from stdin if piped, else a hidden prompt.
@@ -833,6 +880,13 @@ new_apikey() {
     resp=$(api_call PUT "/authentication/api-key" "{\"expiration_minutes\": $(($1 * 24 * 60))}") || return 1
     key=$(printf '%s' "$resp" | jq -r '.api_key // empty')
     [[ -n "$key" ]] || { err "Unexpected response from server: $(sanitize "$resp")"; return 1; }
+    # It is stored and sent with every request from now on: check it is really an API key.
+    if ! [[ "$key" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]] \
+            || ! jwt_payload "$key" | jq -e '.type == "external" and .session_id == "api-key"
+                                             and (.exp | type) == "number"' >/dev/null 2>&1; then
+        err "The server's answer is not a valid API key; nothing was stored."
+        return 1
+    fi
     printf '%s' "$key"
 }
 
@@ -852,9 +906,9 @@ apikey_auto_renew() {
     [[ -z $(find "$RENEW_STAMP" -mmin -60 2>/dev/null) ]] || return 0
     : | write_secret "$RENEW_STAMP"
     load_config
-    uid=$(jwt_payload "$(secret_load apikey "$APIKEY_FILE" || true)" | jq -r '.data.user_id // empty')
+    uid=$(apikey_user_id)
     [[ -n "$uid" ]] || return 0
-    tkn=$(browser_portal_token "$uid" 2>/dev/null) || return 0
+    tkn=$(browser_portal_token "$uid" 30 2>/dev/null) || return 0
     check_portal_token "$tkn" "$uid" 2>/dev/null || return 0
     PORTAL_JWT="$tkn"
     key=$(new_apikey "$KEY_DAYS" 2>/dev/null) || { unset PORTAL_JWT; return 0; }
@@ -892,13 +946,28 @@ cmd_apikey() {
                 || die "--days must be 1-365 (the server maximum is one year)"
             if [[ $from_browser -eq 1 ]]; then
                 load_config
+                # Replacing a key: only a session of the same account will do.
+                local uid="" rc=0 answer
+                uid=$(apikey_user_id)
                 if [[ ! -t 0 ]]; then
                     tkn=$(read_portal_token) || exit 1          # piped in: use exactly that
-                elif tkn=$(browser_portal_token 2>/dev/null) && check_portal_token "$tkn"; then
-                    err "Using the portal session of your web browser ($(portal_user "$tkn"))."
+                    check_portal_token "$tkn" "$uid" || exit 1
+                elif tkn=$(browser_portal_token "$uid" 2>/dev/null) && check_portal_token "$tkn" "$uid"; then
+                    err "Found the portal session of your web browser: $(portal_user "$tkn")."
+                    if [[ -z "$uid" ]]; then
+                        # A first key: make sure the browser isn't logged in as someone else.
+                        read -rp "Create an API key for this account? [y/N] " answer
+                        [[ "$answer" =~ ^[YySs] ]] || die "Cancelled. Log in to the portal with your own account and retry."
+                    fi
                 else
-                    err "No open portal session found in this computer's browsers."
+                    rc=$?
+                    if [[ $rc -eq 3 ]]; then
+                        err "Several IsardVDI accounts are logged in in this computer's browsers."
+                    else
+                        err "No open portal session${uid:+ of the current key account} found in the browsers of this computer."
+                    fi
                     tkn=$(read_portal_token) || exit 1
+                    check_portal_token "$tkn" "$uid" || exit 1
                     err "Token for: $(portal_user "$tkn")"
                 fi
                 PORTAL_JWT="$tkn"

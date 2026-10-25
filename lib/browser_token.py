@@ -12,7 +12,8 @@ Service keyring. Under WSL, also the Windows user's Firefox. Only the portal's c
 and decrypted. KWallet may ask once whether to allow "isardvdi-cli" to read the browser's key.
 
 Exit codes: 0 found, 1 no valid token in any browser (the portal may not be open: the browser
-only refreshes the token while a portal tab is open), 2 usage error.
+only refreshes the token while a portal tab is open), 2 usage error, 3 several accounts are
+logged in and --user-id doesn't say which one to take.
 """
 import argparse
 import base64
@@ -243,17 +244,25 @@ def main():
     if not host:
         return 2
     hosts = (host, "." + host)
-    best = None
+    best = {}  # user_id -> the token that lasts longest
     for source in (firefox_tokens, chromium_tokens):
         try:
             for tkn in source(hosts):
-                if usable(tkn, args.user_id) and (best is None or claims(tkn)["exp"] > claims(best)["exp"]):
-                    best = tkn
+                if usable(tkn, args.user_id):
+                    uid = (claims(tkn).get("data") or {}).get("user_id")
+                    if uid not in best or claims(tkn)["exp"] > claims(best[uid])["exp"]:
+                        best[uid] = tkn
         except Exception as exc:  # one broken browser must not hide the others
             log(f"{source.__name__}: {type(exc).__name__}")
     if not best:
         return 1
-    print(best)
+    if len(best) > 1:
+        # Several people are logged in to the portal in this computer's browsers (a shared
+        # computer): picking one could create a key for someone else's account.
+        print(f"browser_token: {len(best)} different IsardVDI accounts are logged in in this "
+              "computer's browsers; not guessing which one is yours.", file=sys.stderr)
+        return 3
+    print(next(iter(best.values())))
     return 0
 
 
