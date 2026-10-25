@@ -147,8 +147,10 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
   why keys last 90 days and renew themselves. Prefer a shorter `--days` on shared machines.
 - **What comes from the server is checked before use.** Before `sudo wg-quick` runs the VPN
   config as root, the CLI refuses any setting IsardVDI doesn't send to users (`PostUp` and other
-  command hooks, `DNS`, and any route that isn't a private IPv4 network of /16 or smaller, which
-  also blocks a disguised default route such as `0.0.0.0/1, 128.0.0.0/1`). IP addresses, viewer URLs and viewer file types
+  command hooks, `DNS`, and any network that isn't a private IPv4 network of /16 or smaller or that
+  overlaps a network this computer is on, which blocks a disguised default route such as
+  `0.0.0.0/1, 128.0.0.0/1` and a takeover of the home router or the LAN's DNS server). The routes
+  are remembered the first time; if the server later changes them, you're asked to confirm. IP addresses, viewer URLs and viewer file types
   are validated, and names are stripped of terminal control characters before printing.
 - **Consoles share no local devices.** IsardVDI's default RDP file shares your printers, smartcards
   and clipboard with the desktop, and a student controls their own desktop. `console` turns off

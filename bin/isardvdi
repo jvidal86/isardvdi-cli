@@ -13,6 +13,7 @@ TOKEN_FILE="$CONF_DIR/token"
 APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
 RENEW_STAMP="$CONF_DIR/renew-attempt"
+VPN_ROUTES_FILE="$CONF_DIR/vpn-routes"   # the server's VPN routes, as accepted
 KEY_DAYS=90      # default API key lifetime (server maximum: 365)
 RENEW_DAYS=30    # renew automatically when the key has less than this left
 WARN_DAYS=14     # ... and warn when renewing keeps failing
@@ -33,7 +34,7 @@ require python3
 
 # Server data is untrusted on the way to the terminal: strip control characters (escape
 # sequences can rewrite the screen, set the clipboard, ...). JQ_CLEAN is the same for jq output.
-sanitize() { printf '%s' "$*" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g'; }
+sanitize() { printf '%s' "$*" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed ':a;s/\xc2[\x80-\x9f]//g;ta'; }
 JQ_CLEAN='def clean: tostring | gsub("\\p{Cc}"; "?");'
 
 valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; }
@@ -82,17 +83,18 @@ keyring_running() {
     [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
     command -v secret-tool >/dev/null 2>&1 || return 1
     if command -v gdbus >/dev/null 2>&1; then
-        [[ $(timeout 5 gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        [[ $(timeout --foreground 5 gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
             --method org.freedesktop.DBus.NameHasOwner org.freedesktop.secrets 2>/dev/null) == "(true,)" ]]
     elif command -v dbus-send >/dev/null 2>&1; then   # Ubuntu 22.04/WSL often lacks gdbus
-        [[ $(timeout 5 dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        [[ $(timeout --foreground 5 dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets 2>/dev/null) == *"boolean true"* ]]
     else
         return 1   # can't tell whether it runs: files are safer than a possible hang
     fi
 }
-# 60 s leaves time to type the keyring password when it asks to be unlocked.
-keyring() { timeout 60 secret-tool "$@" 2>/dev/null; }
+# 60 s leaves time to type the keyring password when it asks to be unlocked. --foreground keeps
+# Ctrl-C working (timeout otherwise runs the command in its own process group).
+keyring() { timeout --foreground 60 secret-tool "$@" 2>/dev/null; }
 secret_exists() { [[ -f "$2" || -f "$2.in-keyring" ]]; }
 
 secret_load() {
@@ -118,13 +120,15 @@ secret_save() {
     if keyring_ok && printf '%s' "$v" | keyring store --label="isardvdi-cli $1" service isardvdi-cli item "$1" \
             && [[ "$(keyring lookup service isardvdi-cli item "$1")" == "$v" ]]; then
         rm -f "$2"
-        : | write_secret "$2.in-keyring"
+        : | write_secret "$2.in-keyring" || return 1
     else
-        # An older copy may still be in the keyring: remove it, or forget/revoke would miss it.
+        # Explicit "|| return": write_secret's die only ends its side of the pipe, and set -e is
+        # off in many callers' contexts. Without the file, the keyring copy must stay.
+        printf '%s' "$v" | write_secret "$2" || return 1
+        # Then remove the older copy from the keyring, or forget/revoke would miss it.
         if [[ -f "$2.in-keyring" ]] && ! { keyring_running && keyring clear service isardvdi-cli item "$1"; }; then
             err "Note: an older '$1' may remain in the keyring (item 'isardvdi-cli $1')."
         fi
-        printf '%s' "$v" | write_secret "$2"
         rm -f "$2.in-keyring"
     fi
 }
@@ -278,13 +282,15 @@ api_call() {
         jwt=$(get_jwt) || return 1
         # The header comes from a file descriptor, not argv: argv is world-readable in ps/proc,
         # and an API key is valid for up to a year.
+        local curl_rc=0
         resp=$(curl -sS -X "$method" -w '\n%{http_code}' \
             --proto =https --connect-timeout 15 --max-time 120 --globoff \
             -H @<(printf 'Authorization: Bearer %s\n' "$jwt") \
             "${body_args[@]}" \
-            "$URL$path")
+            "$URL$path") || curl_rc=$?
         status="${resp##*$'\n'}"
         body="${resp%$'\n'*}"
+        if [[ $curl_rc -ne 0 ]]; then status=000; body="network error (curl exit $curl_rc)"; fi
         # Never fall back to a SAML login from a portal token or an API key: that would log the
         # web browser out.
         if [[ "$status" == "401" || "$status" == "403" ]] && [[ -n "${PORTAL_JWT:-}" ]]; then
@@ -303,9 +309,22 @@ Copy a fresh cookie value right before pasting and retry."
     done
     if [[ "$status" != 2* ]]; then
         err "HTTP $status on $method $path: $(sanitize "$body")"
+        # 75 (EX_TEMPFAIL): worth retrying (no answer, or a server error); 1: it won't get better.
+        [[ "$status" == 000 || "$status" == 5* ]] && return 75
         return 1
     fi
     printf '%s' "$body"
+}
+
+poll() {
+    # poll CMD... Stdout: CMD's output, or nothing after a temporary failure (network, HTTP 5xx),
+    # so a wait can try again. Any other failure (rejected key, failed sign-in, 4xx) ends the
+    # command: retrying those would only repeat them, sign-ins included.
+    # Callers must check: x=$(poll ...) || exit $? (set -e is off inside "if" and "||").
+    local out rc=0
+    out=$("$@") || rc=$?
+    [[ $rc -eq 0 || $rc -eq 75 ]] || return "$rc"
+    printf '%s' "$out"
 }
 api_get() { api_call GET "$1"; }
 
@@ -374,41 +393,41 @@ vpn_iface_up() { ip link show "$(vpn_iface)" >/dev/null 2>&1; }
 wait_started() {
     # $1=id, $2=timeout-seconds. Prints IP to stdout when ready, exits 1 on timeout.
     # Prints a heartbeat to stderr every 10 s so the user knows it's still alive.
-    local id="$1" timeout="${2:-60}" elapsed=0 d state ip last_state=""
-    while [[ $elapsed -lt $timeout ]]; do
-        # One failed request (network blip, server restart) must not end the wait.
-        d=$(desktop_from_list "$id" 2>/dev/null) || d=""
+    # The deadline is in real seconds (SECONDS), however long each request takes. Returns 124 on
+    # timeout; exits on an error that retrying won't fix.
+    local id="$1" timeout="${2:-60}" start=$SECONDS shown=-10 d state ip last_state=""
+    while (( SECONDS - start < timeout )); do
+        d=$(poll desktop_from_list "$id") || exit $?
         state=$(desktop_state "$d")
         ip=$(desktop_ip "$d")
         if [[ "$state" == "Started" && "$ip" != "null" ]]; then
             printf '%s' "$ip"
             return 0
         fi
-        if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
-            printf '  [%3ds/%ds] state=%s ip=%s\n' "$elapsed" "$timeout" "$state" "$ip" >&2
-            last_state="$state"
+        if [[ "$state" != "$last_state" ]] || (( SECONDS - start - shown >= 10 )); then
+            printf '  [%3ds/%ds] state=%s ip=%s\n' "$((SECONDS - start))" "$timeout" "$state" "$ip" >&2
+            last_state="$state" shown=$((SECONDS - start))
         fi
         sleep 1
-        elapsed=$((elapsed + 1))
     done
-    return 1
+    return 124
 }
 
 wait_state_started() {
     # $1=id, $2=timeout-seconds. Like wait_started, but only waits for state "Started" (no IP
     # needed) and uses get-info, which also works for students' desktops in your deployments.
-    local id="$1" timeout="${2:-60}" elapsed=0 state last_state=""
-    while [[ $elapsed -lt $timeout ]]; do
-        state=$(desktop_state "$(desktop_detail_json "$id" 2>/dev/null || true)")
+    local id="$1" timeout="${2:-60}" start=$SECONDS shown=-10 d state last_state=""
+    while (( SECONDS - start < timeout )); do
+        d=$(poll desktop_detail_json "$id") || exit $?
+        state=$(desktop_state "$d")
         [[ "$state" == "Started" ]] && return 0
-        if [[ "$state" != "$last_state" ]] || (( elapsed > 0 && elapsed % 10 == 0 )); then
-            printf '  [%3ds/%ds] state=%s\n' "$elapsed" "$timeout" "$state" >&2
-            last_state="$state"
+        if [[ "$state" != "$last_state" ]] || (( SECONDS - start - shown >= 10 )); then
+            printf '  [%3ds/%ds] state=%s\n' "$((SECONDS - start))" "$timeout" "$state" >&2
+            last_state="$state" shown=$((SECONDS - start))
         fi
         sleep 1
-        elapsed=$((elapsed + 1))
     done
-    return 1
+    return 124
 }
 
 cmd_init() {
@@ -473,11 +492,13 @@ cmd_start() {
     id=$(find_desktop "$1")
     api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
     echo "Start requested for $id; waiting up to ${START_TIMEOUT} s ..."
-    if ip=$(wait_started "$id" "$START_TIMEOUT"); then
-        echo "Started: ip=$ip"
-    else
-        die "Timed out after ${START_TIMEOUT} s. Check 'isardvdi status' or set ISARDVDI_START_TIMEOUT=300."
-    fi
+    local rc=0
+    ip=$(wait_started "$id" "$START_TIMEOUT") || rc=$?
+    case $rc in
+        0)   echo "Started: ip=$ip" ;;
+        124) die "Timed out after ${START_TIMEOUT} s. Check 'isardvdi status' or set ISARDVDI_START_TIMEOUT=300." ;;
+        *)   exit "$rc" ;;
+    esac
 }
 
 cmd_stop() {
@@ -527,15 +548,16 @@ cmd_ssh() {
                 echo "Desktop is $state — waiting for it to come up..." >&2
                 ;;
         esac
-        if ! ip=$(wait_started "$id" "$START_TIMEOUT"); then
-            die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started with an IP"
-        fi
+        local rc=0
+        ip=$(wait_started "$id" "$START_TIMEOUT") || rc=$?
+        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started with an IP"
+        [[ $rc -eq 0 ]] || exit "$rc"
     fi
 
     # The IP comes from the server: check it before it reaches a shell or ssh.
     valid_ipv4 "$ip" || die "The server returned an invalid IP address: $(sanitize "$ip")"
     # shellcheck disable=SC2016  # $1 expands in the child shell, as an argument, not as code
-    if ! timeout 2 bash -c '</dev/tcp/$1/22' _ "$ip" 2>/dev/null; then
+    if ! timeout --foreground 2 bash -c '</dev/tcp/$1/22' _ "$ip" 2>/dev/null; then
         if vpn_iface_up; then
             die "Cannot reach $ip:22 — '$(vpn_iface)' interface is up locally, but the tunnel looks stale.
 IsardVDI invalidates the WireGuard peer when the web session expires. Refresh it:
@@ -567,23 +589,54 @@ _vpn_fetch() {
     content=$(api_get "/api/v4/item/user/get-vpn")
     [[ "$content" == *"[Interface]"* ]] || die "Unexpected VPN config from server"
     check_vpn_conf "$content"
+    vpn_routes_confirmed "$content"
     printf '%s\n' "$content" | write_secret "$VPN_FILE"
 }
 
-allowed_ips_ok() {
-    # Each route must be an IPv4 network inside 10/8, 172.16/12 or 192.168/16 with a prefix of /16
-    # or longer. Anything wider (0.0.0.0/1 + 128.0.0.0/1 is a default route in disguise) or public,
-    # or any IPv6, would let the server take traffic that isn't meant for IsardVDI.
-    local net a b nets
+cidr_int() {
+    # cidr_int A.B.C.D[/P] DEFAULT-P. Stdout: "IP-as-integer PREFIX", or fails if it isn't a
+    # canonical IPv4 address (octets 0-255, no leading zeros) with a prefix of 0-32.
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})(/([0-9]|[12][0-9]|3[0-2]))?$ ]] || return 1
+    local o1=${BASH_REMATCH[1]} o2=${BASH_REMATCH[2]} o3=${BASH_REMATCH[3]} o4=${BASH_REMATCH[4]}
+    (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )) || return 1
+    echo "$(( (o1 << 24) | (o2 << 16) | (o3 << 8) | o4 )) ${BASH_REMATCH[6]:-$2}"
+}
+
+cidr_overlap() {
+    # cidr_overlap "IP P" "IP P": do the two networks share an address?
+    local a p b q m mask
+    read -r a p <<< "$1"; read -r b q <<< "$2"
+    m=$(( p < q ? p : q ))
+    mask=$(( m == 0 ? 0 : (0xFFFFFFFF << (32 - m)) & 0xFFFFFFFF ))
+    (( (a & mask) == (b & mask) ))
+}
+
+local_networks() {
+    # Networks this computer is directly on (LAN, Docker, ...), other than the IsardVDI tunnel.
+    ip -4 -o route show scope link 2>/dev/null | awk -v dev="$(vpn_iface)" '$2 == "dev" && $3 != dev {print $1}'
+}
+
+vpn_nets_ok() {
+    # vpn_nets_ok "NET, NET..." DEFAULT-PREFIX. Each must be a private IPv4 network (10/8,
+    # 172.16/12, 192.168/16) of /16 or smaller that doesn't overlap a network this computer is on.
+    # Anything else would let the server take traffic that isn't meant for IsardVDI: a disguised
+    # default route (0.0.0.0/1 + 128.0.0.0/1), the home router or the LAN's DNS server (a /32).
+    local net n a p lan nets
     IFS=',' read -ra nets <<< "$1"
+    [[ ${#nets[@]} -gt 0 ]] || return 1
     for net in "${nets[@]}"; do
         net="${net//[[:space:]]/}"
-        [[ "$net" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}/([0-9]{1,2})$ ]] || return 1
-        a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
-        (( 10#${BASH_REMATCH[3]} >= 16 && 10#${BASH_REMATCH[3]} <= 32 )) || return 1
-        (( a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) )) || return 1
+        n=$(cidr_int "$net" "$2") || return 1
+        read -r a p <<< "$n"
+        (( p >= 16 )) || return 1
+        cidr_overlap "$n" "$((10 << 24)) 8" || cidr_overlap "$n" "$((172 << 24 | 16 << 16)) 12" \
+            || cidr_overlap "$n" "$((192 << 24 | 168 << 16)) 16" || return 1
+        while read -r lan; do
+            [[ -n "$lan" ]] || continue
+            lan=$(cidr_int "$lan" 32) || continue
+            if cidr_overlap "$n" "$lan"; then return 1; fi
+        done < <(local_networks)
     done
-    [[ ${#nets[@]} -gt 0 ]]
 }
 
 check_vpn_conf() {
@@ -600,13 +653,35 @@ check_vpn_conf() {
             key="?"
         fi
         case "$key" in
-            Address|PrivateKey|MTU|PublicKey|PresharedKey|Endpoint|PersistentKeepalive) ;;
-            AllowedIPs) allowed_ips_ok "${line#*=}" || bad+=" AllowedIPs(not-a-private-/16-or-smaller)" ;;
+            PrivateKey|MTU|PublicKey|PresharedKey|Endpoint|PersistentKeepalive) ;;
+            Address) vpn_nets_ok "${line#*=}" 32 || bad+=" Address(see-below)" ;;
+            AllowedIPs) vpn_nets_ok "${line#*=}" 32 || bad+=" AllowedIPs(see-below)" ;;
             *) bad+=" $(sanitize "$key")" ;;
         esac
     done <<< "$1"
     [[ -z "$bad" ]] || die "Refusing the VPN config from the server: unexpected setting(s):$bad
-(wg-quick would apply them as root). Nothing was written."
+(wg-quick would apply them as root). Networks must be private IPv4 networks of /16 or smaller
+that don't overlap the networks this computer is on. Nothing was written."
+}
+
+vpn_routes_confirmed() {
+    # The server's routes are remembered the first time (silently when inside 10.0.0.0/8, as
+    # IsardVDI's are); a change needs the user's yes, so a server that turns hostile later can't
+    # quietly take other private networks.
+    local routes known answer
+    routes=$(printf '%s\n' "$1" | sed -n 's/^[[:space:]]*AllowedIPs[[:space:]]*=//p' | tr -d '[:space:]' | tr ',' '\n' | sort -u | paste -sd, -)
+    known=$(cat "$VPN_ROUTES_FILE" 2>/dev/null || true)
+    [[ "$routes" == "$known" ]] && return 0
+    if [[ -z "$known" ]] && ! printf '%s' "$routes" | tr ',' '\n' | grep -qv '^10\.'; then
+        printf '%s\n' "$routes" | write_secret "$VPN_ROUTES_FILE"
+        return 0
+    fi
+    [[ -t 0 ]] || die "The VPN routes from the server changed (${known:-none} -> $routes). Run this in a terminal to confirm."
+    err "The server's VPN routes ${known:+changed from $known }to: $routes"
+    err "Traffic to these networks will go through IsardVDI."
+    read -rp "Accept them? [y/N] " answer
+    [[ "$answer" =~ ^[YySs] ]] || die "VPN config not written."
+    printf '%s\n' "$routes" | write_secret "$VPN_ROUTES_FILE"
 }
 
 cmd_vpn_config() {
@@ -721,25 +796,29 @@ cmd_console() {
                 ;;
             *) echo "Desktop is $state — waiting for it to come up..." >&2 ;;
         esac
-        wait_state_started "$id" "$START_TIMEOUT" \
-            || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started"
+        local rc=0
+        wait_state_started "$id" "$START_TIMEOUT" || rc=$?
+        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started"
+        [[ $rc -eq 0 ]] || exit "$rc"
     fi
 
     if [[ "$viewer_type" == "file-rdpgw" ]]; then
         # The RDP gateway connects to the guest's IP, which only exists on the WireGuard interface
         # and only once the guest OS has booted and taken its address.
-        local info elapsed=0
+        local info start=$SECONDS shown=-10
         info=$(desktop_detail_json "$id")
         printf '%s' "$info" | jq -e '.interfaces // [] | any(.id == "wireguard")' >/dev/null \
             || die "This desktop has no WireGuard interface, which RDP needs. Add 'Wireguard VPN' to its
 networks in the web UI (desktop → Edit → Hardware), or use the SPICE console (without --rdp)."
-        while [[ $(printf '%s' "$info" | jq -r '.ip // ""') == "" ]]; do
-            (( elapsed < START_TIMEOUT )) \
+        while [[ $(desktop_ip "$info") == null ]]; do
+            (( SECONDS - start < START_TIMEOUT )) \
                 || die "Timed out after ${START_TIMEOUT} s waiting for the guest IP (is the guest OS up?)"
-            (( elapsed % 10 == 0 )) && printf '  [%3ds/%ds] waiting for the guest IP...\n' "$elapsed" "$START_TIMEOUT" >&2
+            if (( SECONDS - start - shown >= 10 )); then
+                shown=$((SECONDS - start))
+                printf '  [%3ds/%ds] waiting for the guest IP...\n' "$shown" "$START_TIMEOUT" >&2
+            fi
             sleep 2
-            elapsed=$((elapsed + 2))
-            info=$(desktop_detail_json "$id")
+            info=$(poll desktop_detail_json "$id") || exit $?
         done
     fi
 
@@ -850,7 +929,7 @@ browser_portal_token() {
     # accounts are logged in (exit 3). SECONDS caps the time (keyring prompts included).
     [[ -e "$BROWSER_HELPER" ]] || return 1
     check_helper "$BROWSER_HELPER"
-    timeout "${2:-300}" python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}"
+    timeout --foreground "${2:-300}" python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}"
 }
 
 apikey_user_id() { jwt_payload "$(secret_load apikey "$APIKEY_FILE" 2>/dev/null || true)" | jq -r '.data.user_id // empty'; }
