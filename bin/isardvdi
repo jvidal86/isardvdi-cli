@@ -212,7 +212,9 @@ jwt_payload() {
 
 jwt_exp() {
     # Stdout: the "exp" claim (epoch seconds) of a JWT, or nothing if it can't be decoded.
-    jwt_payload "$1" | jq -r '.exp // empty'
+    # Digits only: callers compare it with [[ -le ]], which evaluates a string as arithmetic,
+    # and arithmetic on a crafted claim like 'a[$(cmd)]' runs cmd.
+    jwt_payload "$1" | jq -r '.exp | numbers | floor | select(. >= 0)'
 }
 
 # An API key has its own pseudo-session ("api-key"), so using it never creates or revokes a
@@ -623,6 +625,24 @@ _vpn_fetch() {
     printf '%s\n' "$content" | write_secret "$VPN_FILE"
 }
 
+private_cidr() {
+    # True if CIDR lies inside 10/8, 172.16/12, 192.168/16, 100.64/10 or fc00::/7.
+    local a b c d p ip range base rp
+    if [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
+        a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} d=${BASH_REMATCH[4]} p=${BASH_REMATCH[5]}
+        (( 10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 && 10#$d <= 255 && 10#$p <= 32 )) || return 1
+        ip=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+        for range in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+            IFS=./ read -r a b c d rp <<< "$range"
+            base=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+            (( 10#$p >= rp && (ip >> (32 - rp)) == (base >> (32 - rp)) )) && return 0
+        done
+        return 1
+    fi
+    [[ "$1" =~ ^[fF][cdCD][0-9a-fA-F]{0,2}:[0-9a-fA-F:]*/([0-9]{1,3})$ ]] \
+        && (( 10#${BASH_REMATCH[1]} >= 7 && 10#${BASH_REMATCH[1]} <= 128 ))
+}
+
 check_vpn_conf() {
     # The file is run by 'sudo wg-quick', which executes PreUp/PostUp/PreDown/PostDown as root
     # shell commands. Accept only the settings IsardVDI puts in a user's config (it never sends
@@ -639,8 +659,12 @@ check_vpn_conf() {
         case "$key" in
             Address|PrivateKey|MTU|PublicKey|PresharedKey|Endpoint|PersistentKeepalive) ;;
             AllowedIPs)
-                # A /0 route would send all of this machine's traffic through the server.
-                [[ "$line" =~ /0([[:space:]]*(,|$)) ]] && bad+=" AllowedIPs(default-route)" ;;
+                # Only private ranges: a public or default route (0.0.0.0/0, or 0.0.0.0/1 plus
+                # 128.0.0.0/1) would send this machine's traffic through the server.
+                local cidr
+                for cidr in $(printf '%s' "${line#*=}" | tr ',' ' '); do
+                    private_cidr "$cidr" || bad+=" AllowedIPs($(sanitize "$cidr"))"
+                done ;;
             *) bad+=" $(sanitize "$key")" ;;
         esac
     done <<< "$1"
