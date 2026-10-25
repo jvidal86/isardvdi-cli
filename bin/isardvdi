@@ -277,6 +277,8 @@ api_call() {
     # IsardVDI revokes the session when the same user logs in elsewhere (e.g. the web browser).
     load_config
     local method="$1" path="$2" data="${3:-}" resp status body attempt jwt
+    # "$URL$path" with a path like ".evil.com/x" or "@evil.com/x" would send the token elsewhere.
+    [[ "$path" =~ ^/[^[:space:][:cntrl:]]*$ ]] || die "Invalid API path: $(sanitize "$path") (must start with /)"
     local body_args=()
     [[ -n "$data" ]] && body_args=(-H "Content-Type: application/json" --data-binary "$data")
     for attempt in 1 2; do
@@ -416,19 +418,28 @@ find_desktop() {
 
 # Media: your own plus the media other users shared with you, tagged with .source.
 media_json() {
-    jq -s '(.[0].media | map(. + {source: "mine"})) + (.[1].media | map(. + {source: "shared"}))' \
-        <(api_get "/api/v4/items/media") <(api_get "/api/v4/items/media/get-shared")
+    # Plain command substitutions: a failure inside <(...) would never be seen. Media shared with
+    # you are optional (some roles or servers lack the endpoint): without them, only yours.
+    local mine shared
+    mine=$(api_get "/api/v4/items/media") || return $?
+    shared=$(api_get "/api/v4/items/media/get-shared" 2>/dev/null) || shared='{}'
+    jq -e 'type == "object"' >/dev/null 2>&1 <<< "$shared" || shared='{}'
+    jq -n --argjson a "$mine" --argjson b "$shared" \
+        '(($a.media // []) | map(. + {source: "mine"})) + (($b.media // []) | map(. + {source: "shared"}))'
 }
 find_media() {
     # Your own media win: a shared item named like yours must not stand in for it.
     local all mine id
     all=$(media_json)
     mine=$(printf '%s' "$all" | jq '[.[] | select(.source == "mine")]')
-    if printf '%s' "$mine" | jq -e --arg q "$1" 'any(.[]; .id == $q
-            or (.name | ascii_downcase | contains($q | ascii_downcase)))' >/dev/null; then
-        pick_by_name "media item" "$mine" "$1"
-        return
-    fi
+    local rc=0
+    printf '%s' "$mine" | jq -e --arg q "$1" 'any(.[]; .id == $q
+            or (.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase)))' >/dev/null || rc=$?
+    case $rc in
+        0) pick_by_name "media item" "$mine" "$1"; return ;;
+        1) ;;   # none of yours matches: look at the shared ones
+        *) die "Could not read your media list." ;;
+    esac
     id=$(pick_by_name "media item" "$(printf '%s' "$all" | jq '[.[] | select(.source == "shared")]')" "$1") || exit 1
     err "Using media shared by another user: $(printf '%s' "$all" | jq -r --arg id "$id" "$JQ_CLEAN"'
         .[] | select(.id == $id) | .name | clean') ($id)"
@@ -437,11 +448,22 @@ find_media() {
 templates_json() { api_get "/api/v4/items/templates" | jq '.templates? // .'; }
 find_template() { pick_by_name template "$(templates_json)" "$1"; }
 find_group() {
-    # Group search used by the web UI's sharing picker (works for non-admin roles).
-    local found
+    # Group search used by the web UI's sharing picker (works for non-admin roles). Exact name or
+    # id only: a prefix like "ASIX" must not quietly share with "ASIX2 Mati".
+    local found exact id
     found=$(api_call POST "/api/v4/items/alloweds/term/groups" \
-        "$(jq -nc --arg t "$1" '{table: "groups", term: $t}')")
-    pick_by_name group "$found" "$1"
+        "$(jq -nc --arg t "$1" '{table: "groups", term: $t}')") || exit 1
+    exact=$(printf '%s' "$found" | jq --arg q "$1" \
+        '[.[] | select(.id == $q or (.name // "" | tostring | ascii_downcase) == ($q | ascii_downcase))]') \
+        || die "Unexpected answer to the group search."
+    if [[ $(jq length <<< "$exact") != 1 ]]; then
+        err "No single group named exactly \"$1\". Groups found:"
+        err "$(printf '%s' "$found" | jq -r "$JQ_CLEAN"' .[] | [.name, .id] | map(clean) | @tsv' 2>/dev/null)"
+        die "Use the exact name or the id."
+    fi
+    id=$(pick_by_name group "$exact" "$1") || exit 1
+    err "Sharing with group: $(jq -r "$JQ_CLEAN"' .[0].name | clean' <<< "$exact") ($id)"
+    printf '%s' "$id"
 }
 
 # Name rule of the web UI's media/template forms (4-50 chars).
@@ -596,7 +618,8 @@ cmd_viewer() {
             vv=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null || true)
         fi
         if [[ -n "$vv" ]]; then
-            printf '%s\n' "$vv" | write_secret "$out"                # atomic, mode 600
+            # Same filtering as console: the desktop may be a student's (no USB or smartcard).
+            printf '%s\n' "$vv" | harden_vv 0 | write_secret "$out" # atomic, mode 600
             echo "$out"
             return
         fi
@@ -1206,22 +1229,23 @@ cmd_apikey() {
 }
 
 wait_media() {
-    # $1=id, $2=timeout-seconds. Returns 0 once the server has the whole file.
-    local id="$1" timeout="$2" elapsed=0 m state pct last=""
-    while [[ $elapsed -lt $timeout ]]; do
-        m=$(media_json | jq --arg id "$id" '.[] | select(.id == $id)')
-        state=$(printf '%s' "$m" | jq -r '.status // "?"')
-        pct=$(printf '%s' "$m" | jq -r '.progress.received_percent // 0')
+    # $1=id, $2=timeout-seconds. Returns 0 once the server has the whole file. Like the other
+    # waits: real seconds, only temporary errors retried, server text cleaned before printing.
+    local id="$1" timeout="$2" start=$SECONDS shown=-30 all m state pct last=""
+    while (( SECONDS - start < timeout )); do
+        all=$(poll media_json) || exit $?
+        m=$(jq --arg id "$id" '.[] | select(.id == $id)' <<< "${all:-[]}" 2>/dev/null || true)
+        state=$(desktop_state "$m")
+        pct=$(jq -r '.progress.received_percent // 0 | if type == "number" then floor else 0 end' <<< "${m:-null}" 2>/dev/null || echo 0)
         case "$state" in
             Downloaded) return 0 ;;
             *Fail*|*Error*|Deleted) err "Media $id ended in state $state"; return 1 ;;
         esac
-        if [[ "$state/$pct" != "$last" ]] || (( elapsed % 30 == 0 )); then
-            printf '  [%4ds/%ds] state=%s %s%%\n' "$elapsed" "$timeout" "$state" "$pct" >&2
-            last="$state/$pct"
+        if [[ "$state/$pct" != "$last" ]] || (( SECONDS - start - shown >= 30 )); then
+            printf '  [%4ds/%ds] state=%s %s%%\n' "$((SECONDS - start))" "$timeout" "$state" "$pct" >&2
+            last="$state/$pct" shown=$((SECONDS - start))
         fi
         sleep 5
-        elapsed=$((elapsed + 5))
     done
     err "Timed out after $timeout s; the download goes on server-side. Check: isardvdi media status $id"
     return 1
@@ -1295,6 +1319,8 @@ cmd_media() {
             [[ -n "$name" && -n "$os" ]] || die "Usage: isardvdi media desktop <media> <desktop-name> --os <id> [options]
 See 'isardvdi media installs' for --os ids."
             check_name "$name"
+            [[ "$memory" =~ ^[0-9]{1,4}$ && "$vcpus" =~ ^[0-9]{1,3}$ && "$disk" =~ ^[0-9]{1,5}$ ]] \
+                || die "--memory, --vcpus and --disk take whole numbers (GB, count, GB)."
             id=$(find_media "$media")
             m=$(media_json | jq --arg id "$id" '.[] | select(.id == $id)')
             [[ $(printf '%s' "$m" | jq -r .status) == Downloaded ]] || die "Media $id is not Downloaded yet"
@@ -1348,9 +1374,12 @@ cmd_template() {
             check_name "$name"
             id=$(find_desktop "$desktop")
             d=$(desktop_from_list "$id")
-            state=$(printf '%s' "$d" | jq -r '.status')
+            state=$(desktop_state "$d")
             [[ "$state" == Stopped ]] || die "Desktop must be Stopped (it is $state): isardvdi stop $id"
-            for g in "${groups[@]}"; do gids+=("$(find_group "$g")"); done
+            for g in "${groups[@]}"; do
+                g=$(find_group "$g") || exit 1   # explicit: an array append doesn't stop on errors
+                gids+=("$g")
+            done
             body=$(api_call POST "/api/v4/item/template" "$(jq -nc --arg d "$id" --arg n "$name" \
                 --argjson en "$enabled" --args '{desktop_id: $d, name: $n, description: "", enabled: $en,
                     allowed: {users: false, groups: (if $ARGS.positional == [] then false else $ARGS.positional end)}}' \
@@ -1542,7 +1571,9 @@ case "$cmd" in
     stop)            cmd_stop "$@" ;;
     ssh)             cmd_ssh "$@" ;;
     viewer|spice)    cmd_viewer "$@" ;;
-    get)             [[ $# -ge 1 ]] || die "Usage: isardvdi get </api/path>"; api_get "$1"; echo ;;
+    get)             [[ $# -ge 1 ]] || die "Usage: isardvdi get </api/path>"
+                     out=$(api_get "$1")   # JSON is re-printed by jq (which escapes control characters)
+                     if jq -e . >/dev/null 2>&1 <<< "$out"; then jq . <<< "$out"; else sanitize "$out"; echo; fi ;;
     vpn-config|vpn)  cmd_vpn_config "$@" ;;
     vpn-reload|vpn-restart) cmd_vpn_reload "$@" ;;
     deployments|deps) cmd_deployments "$@" ;;
