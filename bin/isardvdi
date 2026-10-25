@@ -307,11 +307,11 @@ pick_by_name() {
     # pick_by_name KIND JSON-ARRAY QUERY. Prints the id of the one item whose id equals QUERY or
     # whose name contains it (case-insensitive); an exact name match wins over substrings.
     local kind="$1" json="$2" query="$3" matches count
-    matches=$(printf '%s' "$json" | jq -r --arg q "$query" '
+    matches=$(printf '%s' "$json" | jq -r --arg q "$query" "$JQ_CLEAN"'
         ([.[] | select(.id == $q or (.name | ascii_downcase) == ($q | ascii_downcase))] | unique_by(.id)) as $exact
         | (if ($exact | length) == 1 then $exact
            else [.[] | select(.name | ascii_downcase | contains($q | ascii_downcase))] | unique_by(.id) end)
-        | .[] | [.id, .name] | @tsv')
+        | .[] | [.id, .name] | map(clean) | @tsv')
     count=$(printf '%s' "$matches" | grep -c . || true)
     if [[ "$count" == "0" ]]; then
         die "No $kind matches \"$query\""
@@ -368,7 +368,21 @@ media_json() {
     jq -s '(.[0].media | map(. + {source: "mine"})) + (.[1].media | map(. + {source: "shared"}))' \
         <(api_get "/api/v4/items/media") <(api_get "/api/v4/items/media/get-shared")
 }
-find_media() { pick_by_name "media item" "$(media_json)" "$1"; }
+find_media() {
+    # Your own media win: a shared item named like yours must not stand in for it.
+    local all mine id
+    all=$(media_json)
+    mine=$(printf '%s' "$all" | jq '[.[] | select(.source == "mine")]')
+    if printf '%s' "$mine" | jq -e --arg q "$1" 'any(.[]; .id == $q
+            or (.name | ascii_downcase | contains($q | ascii_downcase)))' >/dev/null; then
+        pick_by_name "media item" "$mine" "$1"
+        return
+    fi
+    id=$(pick_by_name "media item" "$(printf '%s' "$all" | jq '[.[] | select(.source == "shared")]')" "$1") || exit 1
+    err "Using media shared by another user: $(printf '%s' "$all" | jq -r --arg id "$id" "$JQ_CLEAN"'
+        .[] | select(.id == $id) | .name | clean') ($id)"
+    printf '%s' "$id"
+}
 templates_json() { api_get "/api/v4/items/templates" | jq '.templates? // .'; }
 find_template() { pick_by_name template "$(templates_json)" "$1"; }
 find_group() {
@@ -513,24 +527,26 @@ cmd_viewer() {
     # Writes the desktop's SPICE connection file (.vv) and prints its path. The file holds a
     # one-time console password, so it is created mode 600 and its content is never printed.
     [[ $# -ge 1 ]] || die "Usage: isardvdi viewer <name|id> [FILE.vv]"
-    local id out body path
+    local id out body path vv
     id=$(find_desktop "$1")
-    out="${2:-${TMPDIR:-/tmp}/isard-$id.vv}"
+    # Not $TMPDIR//tmp: another user could plant a file or symlink at a predictable name there.
+    out="${2:-${XDG_RUNTIME_DIR:-$CONF_DIR}/isard-$id.vv}"
+    [[ ! -L "$out" ]] || die "Refusing to write $out: it is a symlink."
+    private_path "$out"
     for path in "/api/v4/item/desktop/$id/get-viewer/file-spice" "/api/v3/desktop/$id/viewer/file-spice"; do
-        if body=$(api_get "$path"); then
-            [[ -n "${ISARDVDI_DEBUG:-}" ]] && err "$path: ${body:0:24}…"
-            if [[ "$body" == "[virt-viewer]"* ]]; then
-                ( umask 077; printf '%s\n' "$body" > "$out" )          # the file itself
-            else
-                ( umask 077; printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null > "$out" ) || true
-            fi
-            if [[ -s "$out" ]]; then
-                echo "$out"
-                return
-            fi
+        body=$(api_get "$path") || continue
+        [[ -n "${ISARDVDI_DEBUG:-}" ]] && err "$path: $(sanitize "${body:0:24}")…"
+        if [[ "$body" == "[virt-viewer]"* ]]; then
+            vv="$body"                                                # the file itself
+        else
+            vv=$(printf '%s' "$body" | jq -r '.content // empty' 2>/dev/null || true)
+        fi
+        if [[ -n "$vv" ]]; then
+            printf '%s\n' "$vv" | write_secret "$out"                # atomic, mode 600
+            echo "$out"
+            return
         fi
     done
-    rm -f "$out"
     die "Could not get the SPICE file for $id (is the desktop started?)"
 }
 
@@ -1050,10 +1066,10 @@ cmd_media() {
     [[ $# -gt 0 ]] && shift
     case "$sub" in
         list|ls)
-            media_json | jq -r '
+            media_json | jq -r "$JQ_CLEAN"'
                 (["NAME","KIND","STATUS","SOURCE","ID"]),
                 (.[] | [.name, .kind, (.status + (if .status == "Downloading"
-                        then " \(.progress.received_percent // 0)%" else "" end)), .source, .id])
+                        then " \(.progress.received_percent // 0)%" else "" end)), .source, .id] | map(clean))
                 | @tsv' | column -t -s$'\t'
             ;;
         status)
@@ -1081,8 +1097,11 @@ cmd_media() {
             body=$(api_call POST "/api/v4/item/media" "$(jq -nc --arg n "$name" --arg u "$url" --arg k "$kind" \
                 '{name: $n, description: "", kind: $k, url: $u, hypervisors_pools: ["default"],
                   allowed: {users: false, groups: false}}')")
-            id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)
-            [[ -n "$id" ]] || id=$(find_media "$name")
+            id=$(sanitize "$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)")
+            # No id in the response: only an exact name among your own media is trusted.
+            [[ -n "$id" ]] || id=$(media_json | jq -r --arg n "$name" "$JQ_CLEAN"'
+                [.[] | select(.source == "mine" and .name == $n)] | if length == 1 then .[0].id | clean else empty end')
+            [[ -n "$id" ]] || die "Media created, but its id is unknown; find it with: isardvdi media list"
             echo "Media $id created; the server is downloading it."
             if [[ $wait -eq 1 ]]; then
                 wait_media "$id" "$MEDIA_TIMEOUT" || exit 1
@@ -1123,13 +1142,13 @@ See 'isardvdi media installs' for --os ids."
                   hardware: {boot_order: [$boot], disk_bus: $bus, disk_size: $disk,
                       interfaces: ($nets | split(",")), memory: $mem, vcpus: $cpu,
                       videos: ["default"], reservables: {vgpus: ["None"]}}}')")
-            id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)
+            id=$(sanitize "$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)")
             echo "Desktop \"$name\" created${id:+: $id}. It boots from the media; nothing was started."
             ;;
         installs)
             # OS profiles for 'media desktop --os' (libosinfo ids such as win11, ubuntu24.04).
-            api_get "/api/v4/items/media/installs" | jq -r '
-                (["ID","NAME"]), (.installs[] | [.id, .name]) | @tsv' | column -t -s$'\t' \
+            api_get "/api/v4/items/media/installs" | jq -r "$JQ_CLEAN"'
+                (["ID","NAME"]), (.installs[] | [.id, .name] | map(clean)) | @tsv' | column -t -s$'\t' \
                 | { [[ $# -ge 1 ]] && grep -iE "^ID|$1" || cat; }
             ;;
         *) die "Usage: isardvdi media list|status|add|desktop|installs (see: isardvdi help)" ;;
@@ -1141,9 +1160,9 @@ cmd_template() {
     [[ $# -gt 0 ]] && shift
     case "$sub" in
         list|ls)
-            templates_json | jq -r '
+            templates_json | jq -r "$JQ_CLEAN"'
                 (["NAME","ENABLED","STATUS","ID"]),
-                (.[] | [.name, (.enabled | tostring), .status, .id])
+                (.[] | [.name, (.enabled | tostring), .status, .id] | map(clean))
                 | @tsv' | column -t -s$'\t'
             ;;
         create)
@@ -1170,7 +1189,7 @@ cmd_template() {
                 --argjson en "$enabled" --args '{desktop_id: $d, name: $n, description: "", enabled: $en,
                     allowed: {users: false, groups: (if $ARGS.positional == [] then false else $ARGS.positional end)}}' \
                 "${gids[@]}")")
-            id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)
+            id=$(sanitize "$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null || true)")
             echo "Template \"$name\" requested${id:+: $id}${gids[*]:+, shared with ${#gids[@]} group(s)}."
             echo "The server copies the disk now; check progress with: isardvdi template list"
             ;;
