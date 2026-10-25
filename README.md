@@ -101,6 +101,14 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
 | `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
 | `forget` | Delete every secret stored on this computer (before leaving a shared one) |
+| `media list`, `media status <name\|id>` | Your media and media shared with you, with download progress |
+| `media add <name> <https-url>` | Register an ISO/floppy; the server downloads the URL and the command waits for `Downloaded` |
+| `media desktop <media> <name> --os <id>` | New desktop booting from a media (SATA disk by default, for Windows Setup) |
+| `media installs [filter]` | OS profile ids for `--os` |
+| `template list`, `template create <desktop> <name> [--group G]...` | Make a template from a stopped desktop and share it with groups |
+
+IsardVDI cannot take a file upload: `media add` needs a URL the server can download, for example
+a presigned link to an S3 bucket (`aws s3 presign s3://bucket/file.iso --expires-in 604800`).
 
 `<name|id>` is an exact UUID or a case-insensitive substring of the desktop name.
 See `isardvdi help` for environment variables (`ISARDVDI_START_TIMEOUT`, `SSH_USER`, ...).
