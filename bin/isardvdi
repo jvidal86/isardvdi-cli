@@ -639,7 +639,8 @@ private_cidr() {
         done
         return 1
     fi
-    [[ "$1" =~ ^[fF][cdCD][0-9a-fA-F]{0,2}:[0-9a-fA-F:]*/([0-9]{1,3})$ ]] \
+    # IPv6: the first group needs all 4 digits; 'fc::' is 00fc::, outside fc00::/7.
+    [[ "$1" =~ ^[fF][cdCD][0-9a-fA-F]{2}:[0-9a-fA-F:]*/([0-9]{1,3})$ ]] \
         && (( 10#${BASH_REMATCH[1]} >= 7 && 10#${BASH_REMATCH[1]} <= 128 ))
 }
 
