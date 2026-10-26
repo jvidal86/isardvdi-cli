@@ -168,6 +168,17 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
   which IsardVDI reuses. A host key warning therefore means a different machine: don't ignore it.
 - Do not store desktop passwords in the IsardVDI portal (descriptions and credentials are plain text).
 
+## Tests
+
+```bash
+tests/run.sh            # every test, on this computer
+tests/ubuntu-22.04.sh   # the same CLI on Ubuntu 22.04, as WSL runs it (needs Docker)
+```
+
+The tests run in a throwaway config dir with fake keys and never contact a server; your config,
+API key and VPN files are left alone. If a keyring is running, a few tests store and then delete
+an item named `selftest` in it.
+
 ## License
 
 [MIT](LICENSE)
