@@ -584,6 +584,50 @@ cmd_start() {
     esac
 }
 
+cmd_rename() {
+    # The server only edits a stopped (or failed) desktop: --restart stops a running one, renames
+    # it and starts it again. A desktop that was already stopped stays stopped.
+    local restart=0 target="" name="" id d state start ip
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --restart) restart=1; shift ;;
+            -*) die "Unknown flag: $1" ;;
+            *) if [[ -z "$target" ]]; then target="$1"; elif [[ -z "$name" ]]; then name="$1"
+               else die "Too many arguments"; fi; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "Usage: isardvdi rename <name|id> <new-name> [--restart]"
+    check_name "$name"
+    id=$(find_desktop "$target")
+    d=$(desktop_from_list "$id")
+    [[ -n "$d" ]] || die "Desktop $id not found"
+    state=$(desktop_state "$d")
+    if [[ "$state" == Stopped || "$state" == Failed ]]; then
+        restart=0
+    else
+        [[ $restart -eq 1 ]] || die "Desktop is $state; IsardVDI only renames a stopped desktop.
+Stop it first (isardvdi stop $id), or add --restart."
+        api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null
+        echo "Stopping $id ..." >&2
+        start=$SECONDS
+        until [[ "$state" == Stopped || "$state" == Failed ]]; do
+            (( SECONDS - start < START_TIMEOUT )) \
+                || die "Timed out after $START_TIMEOUT s waiting for $id to stop; nothing was renamed."
+            sleep 2
+            d=$(poll desktop_from_list "$id") || exit $?
+            state=$(desktop_state "$d")
+        done
+    fi
+    api_call PUT "/api/v4/item/desktop/$id/edit" "$(jq -nc --arg n "$name" '{name: $n}')" >/dev/null
+    echo "Renamed $id to \"$name\"."
+    if [[ $restart -eq 1 ]]; then
+        api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
+        ip=$(wait_started "$id" "$START_TIMEOUT") \
+            || die "Renamed, but it isn't Started with an IP after $START_TIMEOUT s. Check: isardvdi status $id"
+        echo "Started again: ip=$ip"
+    fi
+}
+
 cmd_stop() {
     local force=0
     if [[ "${1:-}" == "--force" ]]; then force=1; shift; fi
@@ -1455,6 +1499,10 @@ COMMANDS
     start  <name|id>                Start a desktop and wait until it reaches state
                                     "Started" with an IP. See ISARDVDI_START_TIMEOUT.
     stop   [--force] <name|id>      Stop a desktop. --force re-issues stop after 0.5 s.
+    rename <name|id> <new-name> [--restart]
+                                    Rename a desktop (4-50 letters, digits, spaces, . _ -).
+                                    IsardVDI only edits a stopped desktop: --restart stops a
+                                    running one, renames it and starts it again.
     viewer <name|id> [FILE.vv]      Save the SPICE connection file of a started desktop
                                     (mode 600, one-time password inside) and print its
                                     path. Open it with remote-viewer (virt-viewer).
@@ -1604,6 +1652,7 @@ case "$cmd" in
     status)          cmd_status "$@" ;;
     start)           cmd_start "$@" ;;
     stop)            cmd_stop "$@" ;;
+    rename)          cmd_rename "$@" ;;
     ssh)             cmd_ssh "$@" ;;
     viewer|spice)    cmd_viewer "$@" ;;
     get)             [[ $# -ge 1 ]] || die "Usage: isardvdi get </api/path>"
