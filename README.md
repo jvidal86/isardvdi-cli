@@ -123,6 +123,10 @@ sudo wg-quick up ~/.config/isardvdi-cli/isard-vpn.conf
 isardvdi ssh my-desktop
 ```
 
+If ping works but `ssh` hangs at the key exchange, large packets are being dropped on the way:
+lower the tunnel MTU with `ISARDVDI_VPN_MTU=1280 isardvdi vpn-config` and restart the tunnel.
+On WSL this is the default.
+
 ### Remote control of a Windows desktop over SSH
 
 On the Windows desktop (elevated PowerShell), once:

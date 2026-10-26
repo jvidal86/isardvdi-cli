@@ -693,7 +693,7 @@ Run: sudo wg-quick up $VPN_FILE"
 _vpn_fetch() {
     # _vpn_fetch [reset]. Fetch the VPN config and write it to $VPN_FILE.
     # With "reset" the server rotates the WireGuard peer key first (PUT reset-vpn).
-    local content
+    local content mtu
     if [[ "${1:-}" == "reset" ]]; then
         api_call PUT "/api/v4/item/user/reset-vpn" >/dev/null
     fi
@@ -701,7 +701,38 @@ _vpn_fetch() {
     [[ "$content" == *"[Interface]"* ]] || die "Unexpected VPN config from server"
     check_vpn_conf "$content"
     vpn_routes_confirmed "$content"
+    mtu=$(vpn_mtu)
+    if [[ -n "$mtu" ]]; then
+        content=$(printf '%s\n' "$content" | set_vpn_mtu "$mtu")
+        err "Using MTU $mtu in the VPN config (ISARDVDI_VPN_MTU; 0 keeps the server's value)."
+    fi
     printf '%s\n' "$content" | write_secret "$VPN_FILE"
+}
+
+vpn_mtu() {
+    # Stdout: the MTU to write into the VPN config, or nothing to keep the server's (1420).
+    # WSL2's NAT drops tunnel packets that size allows: pings pass, but SSH hangs at the key
+    # exchange. 1280 is the smallest MTU WireGuard accepts and gets through.
+    local mtu="${ISARDVDI_VPN_MTU:-}"
+    if [[ -z "$mtu" ]] && grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+        mtu=1280
+    fi
+    [[ -z "$mtu" || "$mtu" == 0 ]] && return 0
+    [[ "$mtu" =~ ^[0-9]{4}$ ]] && (( 10#$mtu >= 1280 && 10#$mtu <= 1500 )) \
+        || die "ISARDVDI_VPN_MTU must be 1280-1500, or 0 for the server's value"
+    printf '%d' "$((10#$mtu))"
+}
+
+set_vpn_mtu() {
+    # stdin → stdout: the config with "MTU = $1" in [Interface], replacing the server's line.
+    awk -v mtu="$1" '
+        /^[[:space:]]*\[/ {
+            if (iface && !done) { print "MTU = " mtu; done = 1 }
+            iface = /^[[:space:]]*\[Interface\]/
+        }
+        iface && /^[[:space:]]*MTU[[:space:]]*=/ { if (!done) { print "MTU = " mtu; done = 1 }; next }
+        { print }
+        END { if (iface && !done) print "MTU = " mtu }'
 }
 
 cidr_int() {
@@ -1508,6 +1539,10 @@ ENVIRONMENT
     ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to reach Started state
                              during 'start' and 'ssh'. Default: 180.
     ISARDVDI_MEDIA_TIMEOUT   Seconds 'media add' waits for the download. Default: 3600.
+    ISARDVDI_VPN_MTU         MTU written into the VPN config by 'vpn-config' and
+                             'vpn-reload' (1280-1500; 0 keeps the server's 1420).
+                             Default: 1280 on WSL, whose NAT drops bigger tunnel
+                             packets (SSH hangs at key exchange); else the server's.
     SSH_USER                 Default username for 'isardvdi ssh'. Overrides the
                              "isard" fallback and is itself overridden by '-l USER'.
                              Read from the config file by default.
