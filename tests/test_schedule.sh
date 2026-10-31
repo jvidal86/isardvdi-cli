@@ -25,7 +25,9 @@ deployment_desktops_json() {
 api_call() { echo "$1 $2 ${3:-}" >> "$T/calls"; echo '{}'; }
 using_apikey() { return 0; }
 sleep() { :; }
-run() { rm -f "$T/calls" "$T/sysctl"; ( "$@" ) >"$T/out" 2>&1; rc=$?; }
+# Notifications are recorded, never shown on the desktop running the tests.
+sched_notify() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$T/notify"; }
+run() { rm -f "$T/calls" "$T/sysctl"; ( set -e; "$@" ) >"$T/out" 2>&1; rc=$?; }
 
 echo "== 1 times"
 check "day names, English and Catalan" '[[ "$(day_norm TUE) $(day_norm dj) $(day_norm divendres)" == "Tue Thu Fri" ]]'
@@ -44,7 +46,7 @@ check "added" '[[ $rc == 0 ]] && jq -e ".[0].name == \"aso\" and .[0].before == 
 check "the file is private" '[[ $(stat -c %a "$SCHED_FILE") == 600 ]]'
 check "timer fires 2 min before each class" 'grep -qx "OnCalendar=Tue \*-\*-\* 14:58:00" "$U/isardvdi-schedule-aso.timer" && grep -qx "OnCalendar=Thu \*-\*-\* 15:58:00" "$U/isardvdi-schedule-aso.timer"'
 check "no catch-up run after the computer was off" '! grep -q Persistent "$U/isardvdi-schedule-aso.timer"'
-check "service runs 'schedule run aso'" 'grep -q "^ExecStart=/.* schedule run aso$" "$U/isardvdi-schedule-aso.service"'
+check "service runs 'schedule run aso --from-timer'" 'grep -q "^ExecStart=/.* schedule run aso --from-timer$" "$U/isardvdi-schedule-aso.service"'
 check "timer enabled and started" 'grep -q "enable isardvdi-schedule-aso.timer" "$T/sysctl" && grep -q "restart isardvdi-schedule-aso.timer" "$T/sysctl"'
 check "list shows class, deployments and next run" 'grep -q "Tue 15:00, Thu 16:00" "$T/out" && grep -q "Windows 11 uniquie SID ASIX2  (10 desktops)" "$T/out" && grep -q "next:    Tue 2026-11-03 14:58" "$T/out"'
 run cmd_schedule add aso --at "mon 15:00" --deployment "win server"
@@ -108,13 +110,73 @@ run cmd_schedule run aso
 check "server error: exit != 0, logged FAILED" '[[ $rc != 0 ]] && tail -n 1 "$SCHED_LOG" | grep -q FAILED'
 check "the log keeps a few lines" '[[ $(wc -l < "$SCHED_LOG") -ge 5 ]]'
 
-echo "== 5 without systemd"
+echo "== 5 robustness (review findings)"
+api_call() { echo "$1 $2 ${3:-}" >> "$T/calls"; echo '{}'; }
+cmd_schedule enable aso >/dev/null 2>&1
+rm -f "$SCHED_LOG" "$T/notify"
+STATE=Stopped
+run cmd_schedule run aso
+check "first run ever (no log file yet): exit 0, logged, notified" '[[ $rc == 0 ]] && [[ -s "$SCHED_LOG" ]] && grep -q "|normal$" "$T/notify"'
+date() { if [[ "$1" == +%u ]]; then echo 2; elif [[ "$1" == +%H ]]; then echo 16; elif [[ "$1" == +%M ]]; then echo 30; else command date "$@"; fi; }
+run cmd_schedule run aso --from-timer
+check "from the timer 92 min late (woke from sleep): skipped, nothing sent" '[[ $rc == 0 && ! -e "$T/calls" ]] && tail -n 1 "$SCHED_LOG" | grep -q "skipped: 92 min"'
+date() { if [[ "$1" == +%u ]]; then echo 2; elif [[ "$1" == +%H ]]; then echo 14; elif [[ "$1" == +%M ]]; then echo 58; else command date "$@"; fi; }
+run cmd_schedule run aso --from-timer
+check "from the timer on time: starts" '[[ $rc == 0 ]] && grep -q "/start" "$T/calls"'
+date() { if [[ "$1" == +%u ]]; then echo 2; elif [[ "$1" == +%H ]]; then echo 16; elif [[ "$1" == +%M ]]; then echo 30; else command date "$@"; fi; }
+run cmd_schedule run aso
+check "by hand, late or not: starts" '[[ $rc == 0 ]] && grep -q "/start" "$T/calls"'
+unset -f date
+# The network comes up only on the third try.
+echo 0 > "$T/tries"
+list_deployments_json() {
+    local n; n=$(( $(cat "$T/tries") + 1 )); echo "$n" > "$T/tries"
+    if (( n < 3 )); then echo "HTTP 000 on GET /x: network error" >&2; return 75; fi
+    echo "[{\"id\":\"$D1\",\"name\":\"win server 25 Unique SID\",\"total_desktops\":10},{\"id\":\"$D2\",\"name\":\"Windows 11 uniquie SID ASIX2\",\"total_desktops\":10}]"
+}
+date() { if [[ "$1" == +%u ]]; then echo 2; elif [[ "$1" == +%H ]]; then echo 14; elif [[ "$1" == +%M ]]; then echo 58; else command date "$@"; fi; }
+run cmd_schedule run aso --from-timer
+unset -f date
+check "from the timer: network down twice, retried, then ok" '[[ $rc == 0 && $(cat "$T/tries") -ge 3 ]] && tail -n 1 "$SCHED_LOG" | grep -q "ok:"'
+echo 0 > "$T/tries"
+run cmd_schedule run aso
+check "by hand: no retry, fails at once" '[[ $rc != 0 && $(cat "$T/tries") == 1 ]]'
+check "network down: logged FAILED with the cause" 'tail -n 1 "$SCHED_LOG" | grep -q "FAILED: HTTP 000"'
+list_deployments_json() { echo "[{\"id\":\"$D1\",\"name\":\"win server 25 Unique SID\",\"total_desktops\":10}]"; }
+rm -f "$T/notify"
+run cmd_schedule run aso
+check "a deployment deleted on the server: the other still starts" '[[ $rc == 0 ]] && grep -q "desktop/$S1/start" "$T/calls"'
+check "... logged PARTIAL with its name, critical notification" 'tail -n 1 "$SCHED_LOG" | grep -q "PARTIAL: .*Windows 11 uniquie SID ASIX2" && grep -q "|critical$" "$T/notify"'
+list_deployments_json() { echo "[{\"id\":\"$D1\",\"name\":\"win server 25 Unique SID\",\"total_desktops\":10},{\"id\":\"$D2\",\"name\":\"Windows 11 uniquie SID ASIX2\",\"total_desktops\":10}]"; }
+api_call() { echo "$1 $2" >> "$T/calls"; echo 'HTTP 500 <a href="https://evil.example">Sign in again</a>' >&2; return 75; }
+rm -f "$T/notify"
+run cmd_schedule run aso
+check "server text never reaches the notification" '[[ $rc != 0 ]] && ! grep -q "evil" "$T/notify" && grep -q "FAILED to start" "$T/notify"'
+api_call() { echo "$1 $2 ${3:-}" >> "$T/calls"; echo '{}'; }
+# A deployment whose name contains a stored id is not started by that id.
+list_deployments_json() { echo "[{\"id\":\"$D1\",\"name\":\"w\"},{\"id\":\"$D2\",\"name\":\"Windows 11 uniquie SID ASIX2\"},{\"id\":\"d3333333-3333-3333-3333-333333333333\",\"name\":\"copy of $D1\"}]"; }
+deployment_desktops_json() { echo "[{\"id\":\"$S1\",\"user_name\":\"Pol A\",\"group_name\":\"26-27_ASIX2\",\"status\":\"Stopped\"}]"; }
+cmd_schedule edit aso --no-group >/dev/null 2>&1
+run cmd_schedule run aso
+check "an id never matches another deployment's name" '! grep -q "d3333333" "$T/calls"'
+# systemd refuses: the schedule file is left as it was.
+cp "$SCHED_FILE" "$T/before.json"
+sched_systemctl() { echo "$*" >> "$T/sysctl"; [[ "$1" == enable ]] && { echo "Failed to enable unit" >&2; return 1; }; return 0; }
+run cmd_schedule add bd2 --at "mon 15:00" --deployment "Windows 11"
+check "systemd refuses the timer: refused, file unchanged, no unit left" '[[ $rc != 0 ]] && cmp -s "$SCHED_FILE" "$T/before.json" && [[ ! -e "$U/isardvdi-schedule-bd2.timer" ]] && grep -q "Failed to enable" "$T/out"'
+sched_systemctl() { [[ "$1" == show-environment ]] && return 1; return 0; }
+run cmd_schedule add bd2 --at "mon 15:00" --deployment "Windows 11"
+check "no systemd user session: refused before saving" '[[ $rc != 0 ]] && cmp -s "$SCHED_FILE" "$T/before.json"'
+sched_systemctl() { echo "$*" >> "$T/sysctl"; [[ "$1" == show ]] && echo "Tue 2026-11-03 14:58:00 CET"; return 0; }
+
+echo "== 6 without systemd"
 unset -f systemctl
+# shellcheck disable=SC2123  # no PATH on purpose: no systemctl to find
 ( PATH=/nonexistent; cmd_schedule add nosd --at "mon 15:00" --deployment "win server" ) >/dev/null 2>&1; rc=$?
 check "refused, and nothing saved" '[[ $rc != 0 ]] && ! jq -e "any(.[]; .name == \"nosd\")" "$SCHED_FILE" >/dev/null'
 systemctl() { :; }
 
-echo "== 6 dispatch"
+echo "== 7 dispatch"
 check "schedule dispatched" 'grep -q "^    schedule|schedules|sched) cmd_schedule" "$REPO/bin/isardvdi"'
 
 finish

@@ -169,7 +169,9 @@ and `schedule run aso` starts its desktops right now.
 
 Each schedule is a **systemd user timer on this computer**, so the computer must be on, with you
 logged in (the API key comes from your keyring), at that time; a missed start is not made up later.
-A notification shows how each run went. Only Stopped desktops are started and IsardVDI ignores a
+A notification shows how each run went; a start that comes more than 15 minutes late (the computer
+was asleep) is skipped, and a failed one is retried for about two minutes. Only Stopped or Failed
+desktops are started and IsardVDI ignores a
 start of a running one, so the same schedule on a second computer (your laptop) is harmless.
 
 ### Students' desktops: the bastion

@@ -1,4 +1,5 @@
 # The tests use variables and functions inside the strings check() evaluates.
-disable=SC2034,SC2329,SC2016,SC2064,SC2154
+# SC2089/SC2090: mock JSON is kept in plain strings on purpose.
+disable=SC2034,SC2329,SC2016,SC2064,SC2154,SC2089,SC2090
 source-path=SCRIPTDIR
 shell=bash

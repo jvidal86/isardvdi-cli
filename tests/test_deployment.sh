@@ -34,7 +34,7 @@ api_call() {
     esac
 }
 sleep() { :; }
-run() { rm -f "$T/calls"; ( "$@" ) >"$T/out" 2>&1; rc=$?; }
+run() { rm -f "$T/calls"; ( set -e; "$@" ) >"$T/out" 2>&1; rc=$?; }
 calls() { cut -d' ' -f1,2 "$T/calls" 2>/dev/null | tr '\n' ' '; }
 
 echo "== 1 deployment: whole deployments in one request"
@@ -102,7 +102,7 @@ api_call() {
         *) echo '{}' ;;
     esac
 }
-sshrun() { rm -f "$T/ssh-args" "$T/calls"; ( PATH="$T/bin:$PATH"; cmd_ssh "$@" ) >"$T/out" 2>&1; rc=$?; }
+sshrun() { rm -f "$T/ssh-args" "$T/calls"; ( set -e; PATH="$T/bin:$PATH"; cmd_ssh "$@" ) >"$T/out" 2>&1; rc=$?; }
 sshrun "ASIX.1" abdellah -- hostname
 check "student: ssh to target@bastion -p 443, command passed" \
     '[[ $rc == 0 ]] && [[ "$(tr "\n" " " < "$T/ssh-args")" == "-p 443 -o ForwardAgent=no -o ForwardX11=no $TG@bastion.example.cat hostname " ]]'
@@ -130,6 +130,43 @@ PROFILE_KEY='{"ssh_key":"ssh-ed25519 AAAA x"}'
 deployment_desktops_json() { echo "[{\"id\":\"$S1\",\"user_name\":\"Abdellah A\",\"status\":\"Started\",\"ip\":null}]"; }
 START_TIMEOUT=0 sshrun "ASIX.1" abdellah
 check "no VPN IP: explains the WireGuard card" '[[ $rc != 0 && ! -e "$T/ssh-args" ]] && grep -q "WireGuard" "$T/out"'
+
+echo "== 5b the bastion host is remembered"
+check "first use remembered" '[[ "$(cat "$BASTION_HOST_FILE")" == "bastion.example.cat:443" ]]'
+BASTION_ACTIVE='{"bastion_enabled":true,"ssh":{"enabled":true,"port":22},"id":"'$TG'","bastion_domain":"evil.example.org","bastion_ssh_port":"443"}'
+deployment_desktops_json() { echo "[{\"id\":\"$S1\",\"user_name\":\"Abdellah A\",\"status\":\"Started\",\"ip\":\"10.2.1.1\"}]"; }
+( setsid -w bash -c 'source /dev/stdin; sshrun "ASIX.1" abdellah; cat "$T/out"; exit $rc' <<< "$(declare -f); $(declare -p T TG S1 D1 S2 S3 MINE UUID_RE JQ_CLEAN BASTION_ACTIVE PROFILE_KEY BASTION_HOST_FILE START_TIMEOUT CONF_DIR 2>/dev/null); set +u" ) </dev/null >"$T/tofu" 2>&1; rc=$?
+check "a different bastion host, no terminal to confirm: refused, ssh not run" '[[ $rc != 0 && ! -e "$T/ssh-args" ]] && grep -q "different bastion" "$T/tofu" && grep -q "add -y\|No terminal" "$T/tofu" && [[ "$(cat "$BASTION_HOST_FILE")" == "bastion.example.cat:443" ]]'
+BASTION_ACTIVE='{"bastion_enabled":true,"ssh":{"enabled":true,"port":22},"id":"'$TG'","bastion_domain":"bastion.example.cat","bastion_ssh_port":"0443"}'
+sshrun "ASIX.1" abdellah
+check "a port with a leading zero is read as decimal 443" '[[ $rc == 0 ]] && grep -qx 443 <(sed -n 2p "$T/ssh-args")'
+
+echo "== 5c review fixes: matching, waits, errors"
+list_deployments_json() {
+    echo "[{\"id\":\"$D1\",\"name\":\"Ubuntu 24 server ASIX.1\"},{\"id\":\"$D2\",\"name\":\"copy of $D1\"}]"
+}
+check "an id picks that deployment only" '[[ $(deployments_matching "$D1" | jq length) == 1 ]]'
+check "a name still picks every deployment containing it" '[[ $(deployments_matching "u" | jq length) == 1 && $(deployments_matching "1" | jq length) == 2 ]]'
+check "an exact student name wins over longer ones" '[[ "$(echo "[{\"id\":\"$S1\",\"user_name\":\"Alex\"},{\"id\":\"$S2\",\"user_name\":\"Alexandra B\"}]" | match_one student alex user_name)" == "$S1" ]]'
+list_deployments_json() {
+    echo "[{\"id\":\"$D1\",\"name\":\"Ubuntu 24 server ASIX.1\"},{\"id\":\"$D2\",\"name\":\"Ubuntu 26 Server ASIX2\"}]"
+}
+# --wait waits only on the desktops whose request went through.
+deployment_desktops_json() {
+    [[ "$1" == "$D1" ]] && echo "[{\"id\":\"$S1\",\"user_name\":\"A\",\"group_name\":\"g1\",\"status\":\"$(cat "$T/s1")\"},
+                                {\"id\":\"$S2\",\"user_name\":\"B\",\"group_name\":\"g1\",\"status\":\"Stopped\"}]" || echo '[]'
+}
+echo Stopped > "$T/s1"
+api_call() { echo "$1 $2" >> "$T/calls"; if [[ "$2" == *"$S2"* ]]; then echo '{"description_code": "quota_exceeded"}' >&2; return 1; fi; echo Started > "$T/s1"; echo '{}'; }
+START_TIMEOUT=5 run cmd_deployment start "ASIX.1" --group g1 --wait -y
+check "--wait: a refused desktop isn't waited for" '[[ $rc == 0 ]] && grep -q "All Started" "$T/out" && grep -q "B: quota_exceeded" "$T/out"'
+echo Failed > "$T/s1"
+api_call() { echo "$1 $2" >> "$T/calls"; echo '{}'; }
+START_TIMEOUT=0 run cmd_deployment start "ASIX.1" --group g1 --wait -y
+check "--wait: a desktop that was already Failed is not taken as done" '[[ $rc != 0 ]] && grep -q "not Started yet" "$T/out"'
+api_call() { echo 'HTTP 404 on PUT /x: <html>Not Found</html>' >&2; return 1; }
+run cmd_extend coolify
+check "extend: an error without a code still says why" '[[ $rc != 0 ]] && grep -q "404" "$T/out"'
 
 echo "== 6 bastion on/off/key"
 deployment_desktops_json() { echo "[{\"id\":\"$S1\",\"user_name\":\"Abdellah A\",\"status\":\"Started\",\"ip\":\"10.2.1.1\"}]"; }

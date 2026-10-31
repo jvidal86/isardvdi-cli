@@ -14,6 +14,7 @@ APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
 RENEW_STAMP="$CONF_DIR/renew-attempt"
 VPN_ROUTES_FILE="$CONF_DIR/vpn-routes"   # the server's VPN routes, as accepted
+BASTION_HOST_FILE="$CONF_DIR/bastion-host"   # the bastion host:port, as accepted
 KEY_DAYS=90      # default API key lifetime (server maximum: 365)
 RENEW_DAYS=30    # renew automatically when the key has less than this left
 WARN_DAYS=14     # ... and warn when renewing keeps failing
@@ -370,9 +371,10 @@ match_one() {
     # contains QUERY (case-insensitive); dies listing the candidates if there are none or several.
     local what="$1" query="$2" field="$3" matches count
     matches=$(jq -r --arg q "$query" --arg f "$field" '
-        .[]
-        | select(.[$f] // "" | tostring | ascii_downcase | contains($q | ascii_downcase))
-        | [.id, .[$f]] | map(tostring) | @tsv')
+        ([.[] | select(.[$f] // "" | tostring | ascii_downcase == ($q | ascii_downcase))]) as $exact
+        | (if ($exact | length) == 1 then $exact
+           else [.[] | select(.[$f] // "" | tostring | ascii_downcase | contains($q | ascii_downcase))] end)
+        | .[] | [.id, .[$f]] | map(tostring) | @tsv')
     count=$(printf '%s' "$matches" | grep -c . || true)
     if [[ "$count" == "0" ]]; then
         die "No $what matches \"$query\""
@@ -731,7 +733,7 @@ cmd_extend() {
         fi
         return
     fi
-    code=$(grep -oE '"description_code": ?"[a-z_]+"' <<<"$errmsg" | grep -oE '[a-z_]+"$' | tr -d '"')
+    code=$(grep -oE '"description_code": ?"[a-z_]+"' <<<"$errmsg" | grep -oE '[a-z_]+"$' | tr -d '"') || code=""
     case "$code" in
         desktop_not_started)            die "Can't extend: the desktop is not started." ;;
         desktop_no_scheduled_shutdown)  die "Can't extend: this desktop has no auto-shutdown timer." ;;
@@ -912,11 +914,29 @@ cidr_overlap() {
     (( (a & mask) == (b & mask) ))
 }
 
+tunnel_ifaces() {
+    # The IsardVDI tunnel's interfaces, one per line: wg-quick names it after the config file, but
+    # another tool (NetworkManager) may bring the same config up under another name. That one is
+    # the WireGuard interface holding the address of our saved config (validated when written).
+    vpn_iface
+    local addr dev
+    addr=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$VPN_FILE" 2>/dev/null | head -n 1)
+    valid_ipv4 "$addr" || return 0
+    ip -4 -o addr show 2>/dev/null | awk -v a="$addr" '{split($4, x, "/"); if (x[1] == a) print $2}' \
+        | while read -r dev; do
+            ip -d link show dev "$dev" 2>/dev/null | grep -qw wireguard && printf '%s\n' "$dev"
+        done
+    return 0
+}
+
 local_networks() {
     # What a VPN route must never cover: the networks this computer is directly on (LAN, Docker,
     # ...), other than the IsardVDI tunnel, plus its default gateway and DNS servers, which can be
     # private addresses reached through the router (a school's 10.x DNS server).
-    ip -4 -o route show scope link 2>/dev/null | awk -v dev="$(vpn_iface)" '$2 == "dev" && $3 != dev {print $1}'
+    ip -4 -o route show scope link 2>/dev/null \
+        | awk -v devs="$(tunnel_ifaces | tr '\n' ' ')" \
+            'BEGIN {n = split(devs, d, " "); for (i = 1; i <= n; i++) skip[d[i]] = 1}
+             $2 == "dev" && !($3 in skip) {print $1}'
     ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "via") print $(i+1)}'
     awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null
     if command -v resolvectl >/dev/null 2>&1; then   # systemd-resolved: the real upstream servers
@@ -1058,12 +1078,14 @@ deployments_matching() {
     local all q deps
     all=$(list_deployments_json) || exit 1
     for q in "$@"; do
-        jq -e --arg q "$q" 'any(.[]; .id == $q
-            or (.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase)))' \
+        jq -e --arg q "$q" --arg re "$UUID_RE" 'any(.[]; .id == $q
+            or (($q | test($re) | not) and (.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))))' \
             >/dev/null <<< "$all" || die "No deployment matches \"$q\". See: isardvdi deployments"
     done
-    deps=$(jq -c --args '[.[] | . as $d | select(any($ARGS.positional[]; . as $q | $d.id == $q
-            or ($d.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))))]' \
+    # A query that is an id (as the schedules store) picks that deployment only, never one whose
+    # name happens to contain it.
+    deps=$(jq -c --arg re "$UUID_RE" --args '[.[] | . as $d | select(any($ARGS.positional[]; . as $q | $d.id == $q
+            or (($q | test($re) | not) and ($d.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase)))))]' \
             "$@" <<< "$all")
     # Ids go into URLs.
     jq -e --arg re "$UUID_RE" 'all(.[]; .id | tostring | test($re))' >/dev/null <<< "$deps" \
@@ -1148,7 +1170,7 @@ deployment_bulk() {
         confirm "Go ahead?" || die "Cancelled."
     fi
 
-    local ok=0 failed=0 id who errmsg code
+    local ok=0 failed=0 id who errmsg code acted='[]'   # acted: the desktops whose request went through
     for (( i = 0; i < n; i++ )); do
         dep="${dep_ids[$i]}"
         todo="${dep_todo[$i]}"
@@ -1159,6 +1181,7 @@ deployment_bulk() {
             [[ "$action" == stop ]] && body=$(jq -nc --argjson f "$([[ $force -eq 1 ]] && echo true || echo false)" '{force: $f}')
             if errmsg=$(api_call PUT "/api/v4/item/deployment/$dep/$action" "$body" 2>&1 >/dev/null); then
                 ok=$(( ok + $(jq length <<< "$todo") ))
+                acted=$(jq -c --argjson t "$todo" '. + $t' <<< "$acted")
             else
                 failed=$(( failed + $(jq length <<< "$todo") ))
                 err "${dep_names[$i]}: $errmsg"
@@ -1171,6 +1194,7 @@ deployment_bulk() {
             [[ "$id" =~ $UUID_RE ]] || { failed=$((failed + 1)); err "Skipped an invalid desktop id: $(sanitize "$id")"; continue; }
             if errmsg=$(api_call PUT "/api/v4/item/desktop/$id/$path" 2>&1 >/dev/null); then
                 ok=$((ok + 1))
+                acted=$(jq -c --arg id "$id" --argjson t "$todo" '. + [$t[] | select(.id == $id)]' <<< "$acted")
                 if [[ $force -eq 1 ]]; then   # as 'stop --force': repeat the stop
                     sleep 0.5
                     api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null 2>&1 || true
@@ -1192,27 +1216,27 @@ deployment_bulk() {
     [[ $failed -eq 0 ]] || [[ $ok -gt 0 ]] || exit 1
 
     if [[ $wait -eq 1 && $ok -gt 0 ]]; then
-        deployment_wait "$action" "${dep_ids[@]}" -- "${dep_todo[@]}"
+        deployment_wait "$action" "$acted" "${dep_ids[@]}"
     elif [[ "$action" != extend ]]; then
         echo "Follow it with: isardvdi students <deployment>"
     fi
 }
 
 deployment_wait() {
-    # deployment_wait start|stop DEP... -- TODO-JSON... Waits until each desktop acted on is
-    # Started (start) or Stopped (stop); Failed ends the wait for that desktop too.
-    local action="$1"; shift
-    local deps=() todos=() ids want start=$SECONDS shown=-10 states pending
-    while [[ "$1" != -- ]]; do deps+=("$1"); shift; done
-    shift; todos=("$@")
-    ids=$(printf '%s\n' "${todos[@]}" | jq -sc '[.[][] | .id]')
+    # deployment_wait start|stop ACTED-JSON DEP... Waits until each desktop acted on is Started
+    # (start) or Stopped (stop). Failed ends the wait for a desktop too, unless it was already
+    # Failed before (a start of a Failed desktop goes through Starting first).
+    local action="$1" acted="$2"; shift 2
+    local deps=("$@") init want start=$SECONDS shown=-10 states pending
+    init=$(jq -c 'map({key: .id, value: .status}) | from_entries' <<< "$acted")
     [[ "$action" == start ]] && want=Started || want=Stopped
     while :; do
         states=$(for d in "${deps[@]}"; do poll deployment_desktops_json "$d" || exit $?; done \
-            | jq -sc --argjson ids "$ids" '[.[][] | select(.id as $i | $ids | index($i))]')
+            | jq -sc --argjson init "$init" '[.[][] | select(.id as $i | $init | has($i))]')
         # Counted from the ids: a deployment whose list didn't come back counts as pending.
-        pending=$(jq --arg w "$want" --argjson ids "$ids" \
-            '($ids | length) - ([.[] | select(.status == $w or .status == "Failed")] | length)' <<< "$states")
+        pending=$(jq --arg w "$want" --argjson init "$init" \
+            '($init | length) - ([.[] | select(.status == $w
+                or (.status == "Failed" and $init[.id] != "Failed"))] | length)' <<< "$states")
         if [[ "$pending" == 0 ]]; then
             echo "All $want. Failed: $(jq '[.[] | select(.status == "Failed")] | length' <<< "$states")."
             return 0
@@ -1245,9 +1269,9 @@ bastion_conn() {
     [[ "$target" =~ $UUID_RE ]] || die "The server returned an invalid bastion target: $(sanitize "$target")"
     [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
         || die "The server returned an invalid bastion host: $(sanitize "$host")"
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )) \
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
         || die "The server returned an invalid bastion port: $(sanitize "$port")"
-    printf '%s %s %s' "$target" "$host" "$port"
+    printf '%s %s %s' "$target" "$host" "$((10#$port))"
 }
 
 bastion_enable_hint() {
@@ -1303,10 +1327,26 @@ WireGuard VPN card: check inside it that the card is up and on DHCP (isardvdi co
 
     local target host port
     read -r target host port <<< "$conn"
+    bastion_host_confirmed "$host:$port"
     echo "Connecting through the bastion ($host:$port) ..." >&2
     # One host key for every desktop: the bastion's. The desktop's own key is checked by the
     # bastion, not by you. ForwardAgent/ForwardX11=no as for VPN connections.
     DISPLAY="" exec ssh -p "$port" -o ForwardAgent=no -o ForwardX11=no "$target@$host" "$@"
+}
+
+bastion_host_confirmed() {
+    # The bastion host comes from the server, and ssh would offer your keys to it and open a
+    # shell there. Remembered the first time; a different one later needs your yes.
+    local known
+    known=$(cat "$BASTION_HOST_FILE" 2>/dev/null || true)
+    [[ "$1" == "$known" ]] && return 0
+    if [[ -z "$known" ]]; then
+        err "Bastion: $1 (first use; remembered in $BASTION_HOST_FILE)."
+    else
+        err "The portal now names a different bastion: $1 (it was $known)."
+        confirm "Connect to $1?" || die "Not connected. If this is expected, delete $BASTION_HOST_FILE."
+    fi
+    printf '%s\n' "$1" | write_secret "$BASTION_HOST_FILE"
 }
 
 cmd_bastion() {
@@ -1329,9 +1369,9 @@ bastion_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --desktop) [[ $# -ge 2 ]] || die "--desktop needs a desktop"; B_DESKTOP="$2"; shift 2 ;;
-            --port) [[ $# -ge 2 && "$2" =~ ^[0-9]{1,5}$ ]] && (( $2 >= 1 && $2 <= 65535 )) \
+            --port) [[ $# -ge 2 && "$2" =~ ^[0-9]{1,5}$ ]] && (( 10#$2 >= 1 && 10#$2 <= 65535 )) \
                         || die "--port needs a port number (1-65535)"
-                    B_PORT="$2"; shift 2 ;;
+                    B_PORT=$((10#$2)); shift 2 ;;
             -*) die "Unknown flag: $1" ;;
             *) B_POS+=("$1"); shift ;;
         esac
@@ -1369,7 +1409,7 @@ bastion_status() {
     local dep cfg
     dep=$(find_deployment "${B_POS[0]}") || exit 1
     cfg=$(api_get "/api/v4/item/deployment/$dep/bastion") || exit 1
-    jq -r '"SSH through the bastion: \(if .ssh.enabled then "on" else "off" end) (desktop port \(.ssh.port // 22))",
+    jq -r "$JQ_CLEAN"' "SSH through the bastion: \(if .ssh.enabled then "on" else "off" end) (desktop port \(.ssh.port // 22 | clean))",
            "HTTP through the bastion: \(if .http.enabled then "on" else "off" end)"' <<< "$cfg"
 }
 
@@ -1429,7 +1469,7 @@ bastion_key() {
     [[ -f "$file" ]] || die "No such file: $file"
     # Only a public key leaves this computer: never send a private key by mistake.
     grep -q 'PRIVATE KEY' "$file" && die "$file is a PRIVATE key. Give the .pub file next to it."
-    key=$(grep -vE '^[[:space:]]*(#|$)' "$file" | head -n 1)
+    key=$(grep -vE '^[[:space:]]*(#|$)' "$file" | head -n 1) || key=""
     [[ "$(grep -cvE '^[[:space:]]*(#|$)' "$file")" -eq 1 ]] || die "$file must hold exactly one public key."
     [[ "$key" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\ [A-Za-z0-9+/=]+(\ .*)?$ ]] \
         || die "$file doesn't look like an SSH public key."
@@ -1505,8 +1545,22 @@ sched_cmd_path() {
 sched_systemctl() { systemctl --user "$@"; }
 # Checked before a schedule is saved, so none is left without its timer.
 sched_need_systemd() {
-    command -v systemctl >/dev/null 2>&1 \
-        || die "Schedules need systemd (systemctl --user), which this system lacks. Nothing was changed."
+    command -v systemctl >/dev/null 2>&1 && sched_systemctl show-environment >/dev/null 2>&1 \
+        || die "Schedules need a running systemd user session (systemctl --user), which isn't
+available here (WSL without systemd, or SSH without a desktop login?). Nothing was changed."
+}
+
+# Saves NEW-JSON as the schedules and brings the timers of the NAMEs in line. If systemd refuses,
+# the previous schedules come back, so the file never lists a schedule without its timer.
+sched_commit() {
+    local new="$1" old n; shift
+    old=$(sched_json)
+    sched_save "$new"
+    if ! ( for n in "$@"; do sched_sync "$n" || exit 1; done ); then
+        sched_save "$old"
+        ( for n in "$@"; do sched_sync "$n" || exit 1; done ) >/dev/null 2>&1 || true
+        die "systemd refused the timer (see above). Nothing was changed."
+    fi
 }
 
 # Writes (or removes) the systemd units of schedule $1 to match the file, and (re)starts its timer.
@@ -1521,7 +1575,7 @@ sched_sync() {
         return 0
     fi
     mkdir -p "$SYSTEMD_USER_DIR"
-    printf '[Unit]\nDescription=IsardVDI: start the desktops of schedule %s\n\n[Service]\nType=oneshot\nExecStart=%s schedule run %s\nTimeoutStartSec=15min\n' \
+    printf '[Unit]\nDescription=IsardVDI: start the desktops of schedule %s\n\n[Service]\nType=oneshot\nExecStart=%s schedule run %s --from-timer\nTimeoutStartSec=15min\n' \
         "$name" "$(sched_cmd_path)" "$name" > "$SYSTEMD_USER_DIR/$unit.service"
     {
         printf '[Unit]\nDescription=IsardVDI: start the desktops of schedule %s before class\n\n[Timer]\n' "$name"
@@ -1533,10 +1587,11 @@ sched_sync() {
         # class that is long over when it comes back.
         printf 'AccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n'
     } > "$SYSTEMD_USER_DIR/$unit.timer"
-    sched_systemctl daemon-reload
+    # Explicit "|| die": sched_commit runs this where set -e is off.
+    sched_systemctl daemon-reload || die "systemctl --user daemon-reload failed."
     if [[ $(jq -r '.enabled' <<< "$s") == true ]]; then
-        sched_systemctl enable "$unit.timer" >/dev/null 2>&1
-        sched_systemctl restart "$unit.timer"
+        sched_systemctl enable "$unit.timer" >/dev/null || die "Could not enable $unit.timer."
+        sched_systemctl restart "$unit.timer" || die "Could not start $unit.timer."
     else
         sched_systemctl disable --now "$unit.timer" >/dev/null 2>&1 || true
     fi
@@ -1613,8 +1668,7 @@ sched_add() {
         --argjson g "${S_GROUPS:-[]}" --argjson b "${S_BEFORE:-2}" \
         '{name: $n, slots: $sl, before: $b, deployments: $d, groups: $g, enabled: true}')
     all=$(sched_json | jq -c --argjson e "$entry" '. + [$e]')
-    sched_save "$all"
-    sched_sync "$name"
+    sched_commit "$all" "$name"
     sched_list "$name"
 }
 
@@ -1641,17 +1695,18 @@ sched_edit() {
               | (if $g != "" then .groups = ($g | fromjson) else . end)
               | (if $b != "" then .before = ($b | tonumber) else . end)
             else . end)')
-    sched_save "$all"
-    [[ "$new" == "$name" ]] || sched_sync "$name"   # the old name's units go
-    sched_sync "$new"
+    if [[ "$new" == "$name" ]]; then
+        sched_commit "$all" "$name"
+    else
+        sched_commit "$all" "$name" "$new"   # the old name's units go, the new name's come
+    fi
     sched_list "$new"
 }
 
 sched_remove() {
     [[ $# -eq 1 ]] || die "Usage: isardvdi schedule remove NAME"
     sched_get "$1" >/dev/null || die "No schedule \"$1\". See: isardvdi schedule list"
-    sched_save "$(sched_json | jq -c --arg n "$1" 'map(select(.name != $n))')"
-    sched_sync "$1"
+    sched_commit "$(sched_json | jq -c --arg n "$1" 'map(select(.name != $n))')" "$1"
     echo "Removed schedule \"$1\" (its desktops are not touched)."
 }
 
@@ -1660,9 +1715,8 @@ sched_enable() {
     local action="$1"; shift
     [[ $# -eq 1 ]] || die "Usage: isardvdi schedule $action NAME"
     sched_get "$1" >/dev/null || die "No schedule \"$1\". See: isardvdi schedule list"
-    sched_save "$(sched_json | jq -c --arg n "$1" --argjson on "$([[ $action == enable ]] && echo true || echo false)" \
-        'map(if .name == $n then .enabled = $on else . end)')"
-    sched_sync "$1"
+    sched_commit "$(sched_json | jq -c --arg n "$1" --argjson on "$([[ $action == enable ]] && echo true || echo false)" \
+        'map(if .name == $n then .enabled = $on else . end)')" "$1"
     if [[ "$action" == enable ]]; then echo "Schedule \"$1\" is on."; else echo "Schedule \"$1\" is off (holidays?): isardvdi schedule enable $1"; fi
 }
 
@@ -1687,7 +1741,7 @@ sched_list() {
             "\(.name | clean)\(if .enabled then "" else "   (OFF)" end)",
             "  class:   \(.slots | join(", "))  →  desktops start \(.before) min before",
             (.deployments[] | .id as $id | ([$cur[] | select(.id == $id)][0]) as $d
-             | "  starts:  \(($d.name // .name) | clean)\(if $d then "  (\($d.total_desktops) desktops)" else "" end)"),
+             | "  starts:  \(($d.name // .name) | clean)\(if $d then "  (\($d.total_desktops | clean) desktops)" else "  (not found on the server)" end)"),
             (if (.groups | length) > 0 then "  groups:  \(.groups | map(clean) | join(", ")) only" else empty end),
             "  next:    \(if .enabled and $next != "" and $next != "n/a" then $next else "-" end)",
             (if $last != "" then "  last:    \($last | clean)" else empty end),
@@ -1696,9 +1750,20 @@ sched_list() {
 }
 
 sched_run() {
-    # What the timer runs (also by hand: starts the desktops now). Idempotent: see above.
-    [[ $# -eq 1 ]] || die "Usage: isardvdi schedule run NAME"
-    local name="$1" s ids=() groups=() args=() out rc=0 msg
+    # What the timer runs (by hand it starts the desktops now). Idempotent: see above.
+    # --from-timer: skip a start that comes late (the computer was asleep or off at start time),
+    # and retry a failed one for a couple of minutes (the network may still be coming up).
+    local name="" from_timer=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from-timer) from_timer=1 ;;
+            -*) die "Unknown flag: $1" ;;
+            *) [[ -z "$name" ]] || die "Usage: isardvdi schedule run NAME"; name="$1" ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || die "Usage: isardvdi schedule run NAME"
+    local s late all ids=() missing="" args=() g out="" rc=1 msg attempt
     s=$(sched_get "$name") || die "No schedule \"$name\"."
     # Never fall back to a Microsoft sign-in from a timer: it would log the web browser out.
     using_apikey || die "Schedules need an API key (isardvdi apikey create --from-browser)."
@@ -1706,31 +1771,74 @@ sched_run() {
         sched_log "$name" "skipped: the schedule is off"
         return 0
     fi
-    mapfile -t ids < <(jq -r '.deployments[].id' <<< "$s")
-    mapfile -t groups < <(jq -r '.groups[]' <<< "$s")
-    args=("${ids[@]}")
-    local g
-    for g in ${groups[@]+"${groups[@]}"}; do args+=(--group "$g"); done
-    out=$( (deployment_bulk start "${args[@]}" -y) 2>&1 ) || rc=$?
-    printf '%s\n' "$out"
-    msg=$(printf '%s\n' "$out" | grep -E '^(Start requested|Nothing to do)' | head -n 1)
-    if [[ $rc -eq 0 ]]; then
-        [[ "$msg" == "Nothing to do"* ]] && msg="nothing to do: all already running"
-        sched_log "$name" "ok: ${msg:-done}"
-        sched_notify "$name" "${msg:-done}" normal
-    else
-        msg=$(printf '%s\n' "$out" | tail -n 1)
-        sched_log "$name" "FAILED: $msg"
-        sched_notify "$name" "FAILED: $msg" critical
-        exit "$rc"
+    if [[ $from_timer -eq 1 ]]; then
+        late=$(sched_minutes_late "$s")
+        if (( late > 15 )); then
+            sched_log "$name" "skipped: $late min after start time (computer asleep or off?)"
+            return 0
+        fi
     fi
+    for attempt in 1 2 3 4; do
+        rc=0 missing=""
+        # A deployment deleted on the server is left out; the others still start.
+        if all=$(list_deployments_json 2>&1) && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$all"; then
+            mapfile -t ids < <(jq -r --argjson all "$all" \
+                '.deployments[].id | select(. as $i | any($all[]; .id == $i))' <<< "$s")
+            missing=$(jq -r --argjson all "$all" "$JQ_CLEAN"' [.deployments[]
+                | select(.id as $i | any($all[]; .id == $i) | not) | .name | clean] | join(", ")' <<< "$s")
+            if (( ${#ids[@]} == 0 )); then
+                rc=1 out="None of its deployments exists on the server any more."
+            else
+                args=("${ids[@]}")
+                while IFS= read -r g; do [[ -n "$g" ]] && args+=(--group "$g"); done < <(jq -r '.groups[]' <<< "$s")
+                out=$( (deployment_bulk start "${args[@]}" -y) 2>&1 ) || rc=$?
+            fi
+        else
+            rc=1 out="$all"
+        fi
+        printf '%s\n' "$out"
+        [[ $rc -ne 0 && $from_timer -eq 1 && $attempt -lt 4 ]] || break
+        sleep 30
+    done
+    [[ -z "$missing" ]] || missing=" Not on the server any more: $missing."
+    if [[ $rc -eq 0 ]]; then
+        msg=$(printf '%s\n' "$out" | grep -E '^(Start requested|Nothing to do)' | head -n 1) || msg=""
+        [[ "$msg" == "Nothing to do"* ]] && msg="nothing to do: all already running"
+        if [[ "$msg" == *failed* || -n "$missing" ]]; then
+            sched_log "$name" "PARTIAL: ${msg:-done}$missing"
+            sched_notify "$name" "Some desktops did not start. See: isardvdi schedule list" critical
+        else
+            sched_log "$name" "ok: ${msg:-done}"
+            sched_notify "$name" "${msg:-done}" normal
+        fi
+    else
+        # The log keeps the cause (server text, sanitized); the notification only text of ours.
+        sched_log "$name" "FAILED: $(printf '%s\n' "$out" | tail -n 1)"
+        sched_notify "$name" "FAILED to start the desktops. See: isardvdi schedule list" critical
+        exit 1
+    fi
+}
+
+sched_minutes_late() {
+    # Minutes since the most recent start time (class time minus "before") of schedule JSON $1.
+    local s="$1" now slot fire t i day hm best=99999 d
+    now=$(( ($(date +%u) - 1) * 1440 + 10#$(date +%H) * 60 + 10#$(date +%M) ))
+    while IFS= read -r slot; do
+        fire=$(slot_minus "$slot" "$(jq -r '.before' <<< "$s")")
+        day="${fire%% *}" hm="${fire##* }"
+        for i in "${!DAYS[@]}"; do [[ "${DAYS[$i]}" == "$day" ]] && break; done
+        t=$(( i * 1440 + 10#${hm%%:*} * 60 + 10#${hm##*:} ))
+        d=$(( ((now - t) % 10080 + 10080) % 10080 ))
+        (( d < best )) && best=$d
+    done < <(jq -r '.slots[]' <<< "$s")
+    echo "$best"
 }
 
 sched_log() {
     # Keeps the last 200 runs.
     local line tmp
     line="$(date '+%a %F %R') [$1] $(sanitize "$2")"
-    tmp=$( { tail -n 199 "$SCHED_LOG" 2>/dev/null; printf '%s\n' "$line"; } )
+    tmp=$( { tail -n 199 "$SCHED_LOG" 2>/dev/null || true; printf '%s\n' "$line"; } )
     printf '%s\n' "$tmp" | write_secret "$SCHED_LOG"
 }
 
@@ -1801,21 +1909,15 @@ cmd_console() {
     if [[ "$viewer_type" == "file-rdpgw" ]]; then
         # The RDP gateway connects to the guest's IP, which only exists on the WireGuard interface
         # and only once the guest OS has booted and taken its address.
-        local info start=$SECONDS shown=-10
+        local info rc=0
         info=$(desktop_detail_json "$id")
         printf '%s' "$info" | jq -e '.interfaces // [] | any(.id == "wireguard")' >/dev/null \
             || die "This desktop has no WireGuard interface, which RDP needs. Add 'Wireguard VPN' to its
 networks in the web UI (desktop → Edit → Hardware), or use the SPICE console (without --rdp)."
-        while [[ $(desktop_ip "$info") == null ]]; do
-            (( SECONDS - start < START_TIMEOUT )) \
-                || die "Timed out after ${START_TIMEOUT} s waiting for the guest IP (is the guest OS up?)"
-            if (( SECONDS - start - shown >= 10 )); then
-                shown=$((SECONDS - start))
-                printf '  [%3ds/%ds] waiting for the guest IP...\n' "$shown" "$START_TIMEOUT" >&2
-            fi
-            sleep 2
-            info=$(poll desktop_detail_json "$id") || exit $?
-        done
+        # From desktop_now: get-info has no IP for a student's desktop, its deployment's list has.
+        wait_target "$START_TIMEOUT" 1 >/dev/null || rc=$?
+        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for the guest IP (is the guest OS up?)"
+        [[ $rc -eq 0 ]] || exit "$rc"
     fi
 
     # Right after a start the viewer data can lag a few seconds behind the state.
@@ -1853,6 +1955,7 @@ networks in the web UI (desktop → Edit → Hardware), or use the SPICE console
         *) die "Unexpected viewer file type from the server: $(sanitize "$ext")" ;;
     esac
     dir=$(umask 077; mktemp -d "${XDG_RUNTIME_DIR:-$CONF_DIR}/isardvdi-console-XXXXXX")
+    # shellcheck disable=SC2064
     trap "rm -rf $(printf '%q' "$dir")" EXIT   # expanded now: $dir is local, gone at exit
     file="$dir/console.$ext"
     # The file's settings come from the server; strip every device redirection from them.
@@ -2359,8 +2462,11 @@ COMMANDS
                                     before each class, by a systemd user timer on this
                                     computer (it must be on, with you logged in). DAY: mon..
                                     sun or dl dt dc dj dv ds dg, several as "tue,thu 15:00".
-                                    Only Stopped desktops are started: running it from two
-                                    computers is harmless. Results: notification + list.
+                                    Needs an API key. Only Stopped or Failed desktops are
+                                    started, so running it from two computers is harmless.
+                                    A start more than 15 min late (computer asleep) is
+                                    skipped; a failed one is retried for ~2 min.
+                                    Results: notification + 'schedule list'.
     schedule edit NAME [--at ...]... [--deployment ...]... [--group ...]... [--no-group]
                   [--before MIN] [--rename NEW]
                                     Change a schedule; a repeated option replaces them all.
@@ -2431,8 +2537,9 @@ ENVIRONMENT
     ISARDVDI_KEYRING=0       Keep the API key and token in private files instead of the
                              system keyring (for WSL or servers without a desktop session;
                              without a running keyring this happens by itself).
-    ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to reach Started state
-                             during 'start' and 'ssh'. Default: 180.
+    ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to start (or stop) in
+                             start, ssh, console, rename --restart and
+                             deployment --wait. Default: 180.
     ISARDVDI_MEDIA_TIMEOUT   Seconds 'media add' waits for the download. Default: 3600.
     ISARDVDI_VPN_MTU         MTU written into the VPN config by 'vpn-config' and
                              'vpn-reload' (1280-1500; 0 keeps the server's 1420).
@@ -2479,6 +2586,7 @@ EXAMPLES
 EXIT STATUS
     0  Success.
     1  Any error (no match, bad credentials, server error, timeout, ...).
+    75 A temporary failure (no answer, server error): worth trying again.
 
 SEE ALSO
     isardvdi(1), wg-quick(8), ssh(1)

