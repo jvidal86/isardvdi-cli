@@ -484,7 +484,6 @@ find_group() {
 
 
 vpn_iface() { basename "$VPN_FILE" .conf; }
-vpn_iface_up() { ip link show "$(vpn_iface)" >/dev/null 2>&1; }
 
 # The desktop a command acts on: <desktop> (yours, by name or id; any id works) or
 # <deployment> <student> (a student's desktop in a deployment you own). Sets TARGET_ID,
@@ -808,13 +807,18 @@ $usage" ;;
     valid_ipv4 "$ip" || die "The server returned an invalid IP address: $(sanitize "$ip")"
     # shellcheck disable=SC2016  # $1 expands in the child shell, as an argument, not as code
     if ! timeout --foreground 2 bash -c '</dev/tcp/$1/22' _ "$ip" 2>/dev/null; then
-        if vpn_iface_up; then
-            die "Cannot reach $ip:22 — '$(vpn_iface)' interface is up locally, but the tunnel looks stale.
+        vpn_state
+        if [[ -n "$VPN_DEV" && "$VPN_BY" == wg-quick ]]; then
+            die "Cannot reach $ip:22 — '$VPN_DEV' interface is up locally, but the tunnel looks stale.
 IsardVDI invalidates the WireGuard peer when the web session expires. Refresh it:
-    isardvdi vpn-reload"
+    isardvdi vpn reload"
+        elif [[ -n "$VPN_DEV" ]]; then
+            # New keys would stop this tunnel's own copy: fetch the current ones, then update it.
+            die "Cannot reach $ip:22 — '$VPN_DEV' is up locally, but the tunnel looks stale. Get the
+current config (isardvdi vpn config), then update that tunnel's own copy of it."
         else
             die "Cannot reach $ip:22 — the IsardVDI WireGuard VPN is not up.
-Run: sudo wg-quick up $VPN_FILE"
+Run: isardvdi vpn up"
         fi
     fi
 
@@ -892,13 +896,18 @@ cidr_overlap() {
     (( (a & mask) == (b & mask) ))
 }
 
+vpn_conf_addr() {
+    # The tunnel address in the saved config (validated when written), or nothing.
+    sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$VPN_FILE" 2>/dev/null | head -n 1
+}
+
 tunnel_ifaces() {
     # The IsardVDI tunnel's interfaces, one per line: wg-quick names it after the config file, but
     # another tool (NetworkManager) may bring the same config up under another name. That one is
-    # the WireGuard interface holding the address of our saved config (validated when written).
+    # the WireGuard interface holding the address of our saved config.
     vpn_iface
     local addr dev
-    addr=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$VPN_FILE" 2>/dev/null | head -n 1)
+    addr=$(vpn_conf_addr)
     valid_ipv4 "$addr" || return 0
     ip -4 -o addr show 2>/dev/null | awk -v a="$addr" '{split($4, x, "/"); if (x[1] == a) print $2}' \
         | while read -r dev; do
@@ -994,38 +1003,194 @@ vpn_routes_confirmed() {
     printf '%s\n' "$routes" | write_secret "$VPN_ROUTES_FILE"
 }
 
-cmd_vpn_config() {
-    if ! command -v wg-quick >/dev/null 2>&1; then
-        die "wg-quick not found. Install with: sudo apt install wireguard"
+need_wg_quick() {
+    command -v wg-quick >/dev/null 2>&1 || die "wg-quick not found. Install with: sudo apt install wireguard"
+}
+
+vpn_up_iface() {
+    # Stdout: the tunnel's interface that is up now (wg-quick's, or another tool's); fails if none.
+    local dev
+    while read -r dev; do
+        if [[ -n "$dev" ]] && ip link show "$dev" >/dev/null 2>&1; then printf '%s' "$dev"; return 0; fi
+    done < <(tunnel_ifaces)
+    return 1
+}
+
+vpn_nm_uuid() {
+    # vpn_nm_uuid [DEV]. Stdout: the NetworkManager connection (uuid) of the tunnel: the one active
+    # on DEV, or without DEV a WireGuard connection with the saved config's address. Fails if none.
+    command -v nmcli >/dev/null 2>&1 || return 1
+    local u t addr
+    if [[ $# -gt 0 ]]; then
+        u=$(nmcli -g GENERAL.CON-UUID device show "$1" 2>/dev/null) || return 1
+        [[ "$u" =~ $UUID_RE ]] || return 1
+        printf '%s' "$u"; return 0
     fi
-    _vpn_fetch
-    echo "Wrote $VPN_FILE"
-    if vpn_iface_up; then
-        echo "Interface '$(vpn_iface)' is already up — restart it if the config changed:"
-        echo "    sudo wg-quick down $VPN_FILE && sudo wg-quick up $VPN_FILE"
-        echo "(Or just run: isardvdi vpn-reload)"
+    addr=$(vpn_conf_addr)
+    valid_ipv4 "$addr" || return 1
+    while IFS=: read -r u t; do
+        [[ "$t" == wireguard && "$u" =~ $UUID_RE ]] || continue
+        if nmcli -g ipv4.addresses connection show uuid "$u" 2>/dev/null | tr ',' '\n' | tr -d ' ' \
+            | grep -qE "^${addr//./\\.}(/[0-9]+)?$"; then
+            printf '%s' "$u"; return 0
+        fi
+    done < <(nmcli -g UUID,TYPE connection show 2>/dev/null)
+    return 1
+}
+
+vpn_nm_name() { sanitize "$(nmcli -g connection.id connection show uuid "$1" 2>/dev/null | head -n 1)"; }
+
+vpn_state() {
+    # Sets VPN_DEV (the tunnel's interface when up, else empty), VPN_NM (the NetworkManager
+    # connection's uuid, up or down, else empty) and VPN_BY: who runs the tunnel, or would bring
+    # it up: wg-quick, networkmanager, or other (up, but by a tool this can't drive).
+    VPN_DEV="" VPN_NM="" VPN_BY=wg-quick
+    VPN_DEV=$(vpn_up_iface) || VPN_DEV=""
+    [[ -z "$VPN_DEV" || "$VPN_DEV" != "$(vpn_iface)" ]] || return 0
+    if [[ -n "$VPN_DEV" ]]; then
+        VPN_NM=$(vpn_nm_uuid "$VPN_DEV") && VPN_BY=networkmanager || { VPN_NM=""; VPN_BY=other; }
+    elif VPN_NM=$(vpn_nm_uuid); then
+        VPN_BY=networkmanager
     else
-        echo "To bring the tunnel up:   sudo wg-quick up $VPN_FILE"
-        echo "To bring the tunnel down: sudo wg-quick down $VPN_FILE"
+        VPN_NM=""
+    fi
+    return 0
+}
+
+vpn_root() {
+    # vpn_root up|down: wg-quick on the saved config, as root. wg-quick runs the config's hooks as
+    # root, so the file is checked again first: something may have changed it since it was written.
+    # Root comes from sudo in a terminal, else sudo without a password, else the desktop's own
+    # password prompt (pkexec), which is how the tray asks.
+    local conf wg rc=0
+    [[ -f "$VPN_FILE" ]] || die "No VPN config yet. Run: isardvdi vpn config"
+    conf=$(cat "$VPN_FILE")
+    check_vpn_conf "$conf"
+    vpn_routes_confirmed "$conf"
+    wg=$(command -v wg-quick) || need_wg_quick
+    if [[ -t 0 ]]; then
+        err "Bringing the VPN $1 (sudo may ask for your password) ..."
+        sudo "$wg" "$1" "$VPN_FILE" || rc=$?
+    elif sudo -n true 2>/dev/null; then
+        sudo -n "$wg" "$1" "$VPN_FILE" || rc=$?
+    elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v pkexec >/dev/null 2>&1; then
+        pkexec "$wg" "$1" "$VPN_FILE" || rc=$?
+        # pkexec: 126 = the password prompt was dismissed, 127 = not authorized / no prompt.
+        [[ $rc -ne 126 && $rc -ne 127 ]] || die "Bringing the VPN $1 needs your password, and none was given (or there is no
+password prompt here): nothing was changed. Or run 'isardvdi vpn $1' in a terminal."
+    else
+        die "Bringing the VPN $1 needs root: run 'isardvdi vpn $1' in a terminal."
+    fi
+    [[ $rc -eq 0 ]] || die "wg-quick $1 failed (exit $rc)."
+}
+
+vpn_up() {
+    [[ $# -eq 0 ]] || die "Usage: isardvdi vpn up"
+    vpn_state
+    if [[ -n "$VPN_DEV" ]]; then echo "The VPN is already up ($VPN_DEV)."; return 0; fi
+    if [[ "$VPN_BY" == networkmanager ]]; then
+        # NetworkManager's connection uses its own copy of the config; the user may bring it up.
+        nmcli connection up uuid "$VPN_NM" >/dev/null \
+            || die "NetworkManager couldn't bring up its connection \"$(vpn_nm_name "$VPN_NM")\"."
+        echo "The VPN is up (NetworkManager connection \"$(vpn_nm_name "$VPN_NM")\")."
+        return 0
+    fi
+    need_wg_quick
+    [[ -f "$VPN_FILE" ]] || { _vpn_fetch; echo "Wrote $VPN_FILE"; }
+    vpn_root up
+    echo "The VPN is up ($(vpn_iface))."
+}
+
+vpn_down() {
+    [[ $# -eq 0 ]] || die "Usage: isardvdi vpn down"
+    vpn_state
+    if [[ -z "$VPN_DEV" ]]; then echo "The VPN is already down."; return 0; fi
+    case "$VPN_BY" in
+        networkmanager)
+            nmcli connection down uuid "$VPN_NM" >/dev/null \
+                || die "NetworkManager couldn't bring down its connection \"$(vpn_nm_name "$VPN_NM")\"."
+            echo "The VPN is down (NetworkManager connection \"$(vpn_nm_name "$VPN_NM")\")." ;;
+        wg-quick)
+            vpn_root down
+            echo "The VPN is down." ;;
+        *)  die "The tunnel ($VPN_DEV) was brought up by another tool: bring it down there." ;;
+    esac
+}
+
+vpn_status() {
+    local json=0
+    case "${1:-}" in --json) json=1 ;; "") ;; *) die "Usage: isardvdi vpn status [--json]" ;; esac
+    vpn_state
+    local name=""
+    [[ -z "$VPN_NM" ]] || name=$(vpn_nm_name "$VPN_NM")
+    if [[ $json -eq 1 ]]; then
+        jq -n --arg file "$VPN_FILE" --argjson configured "$([[ -f "$VPN_FILE" ]] && echo true || echo false)" \
+            --arg dev "$VPN_DEV" --arg by "$VPN_BY" --arg name "$name" \
+            '{configured: $configured, file: $file, up: ($dev != ""), interface: $dev, by: $by, connection: $name}'
+        return 0
+    fi
+    if [[ -n "$VPN_DEV" ]]; then
+        echo "VPN: up ($VPN_DEV${name:+, NetworkManager connection \"$name\"})"
+    else
+        echo "VPN: down${name:+ (NetworkManager connection \"$name\")}"
+    fi
+    if [[ -f "$VPN_FILE" ]]; then echo "Config: $VPN_FILE"; else echo "No config yet. Run: isardvdi vpn config"; fi
+}
+
+cmd_vpn_config() {
+    # --apply: also restart a wg-quick tunnel that is up, when the config changed.
+    local apply=0 before
+    case "${1:-}" in --apply) apply=1 ;; "") ;; *) die "Usage: isardvdi vpn config [--apply]" ;; esac
+    before=$(cat "$VPN_FILE" 2>/dev/null || true)
+    _vpn_fetch
+    vpn_state
+    if [[ "$(cat "$VPN_FILE")" == "$before" ]]; then
+        echo "The VPN config is up to date: $VPN_FILE"
+        [[ -n "$VPN_DEV" ]] || echo "To bring the tunnel up: isardvdi vpn up"
+        return 0
+    fi
+    echo "Wrote $VPN_FILE"
+    if [[ -z "$VPN_DEV" ]]; then
+        [[ "$VPN_BY" != networkmanager ]] || echo "NetworkManager's connection \"$(vpn_nm_name "$VPN_NM")\" keeps its own copy of the config."
+        echo "To bring the tunnel up: isardvdi vpn up"
+    elif [[ "$VPN_BY" == wg-quick && $apply -eq 1 ]]; then
+        vpn_root down
+        vpn_root up
+        echo "Restarted the tunnel with it."
+    elif [[ "$VPN_BY" == wg-quick ]]; then
+        echo "The tunnel is still up with the old one. Restart it: isardvdi vpn down && isardvdi vpn up"
+    else
+        echo "The tunnel ($VPN_DEV) is another tool's, with its own copy of the config: update it there."
+        [[ "$VPN_BY" != networkmanager ]] || echo "    nmcli connection delete uuid $VPN_NM && nmcli connection import type wireguard file $VPN_FILE"
     fi
 }
 
 cmd_vpn_reload() {
     # Rotate the VPN keys server-side, re-fetch the config and bounce the tunnel.
-    # Needs sudo for wg-quick. sudo caches credentials so this is one password prompt.
-    if ! command -v wg-quick >/dev/null 2>&1; then
-        die "wg-quick not found. Install with: sudo apt install wireguard"
-    fi
+    need_wg_quick
+    vpn_state
+    # New keys stop a tunnel that keeps its own copy of the config.
+    [[ "$VPN_BY" == wg-quick ]] || die "The tunnel is NetworkManager's or another tool's, with its own copy of the
+config: new keys would stop it. Use 'isardvdi vpn config' (same keys), or bring that tunnel
+down and delete it first."
     _vpn_fetch reset
     echo "Refreshed $VPN_FILE"
-    if vpn_iface_up; then
-        echo "Bouncing tunnel '$(vpn_iface)' (sudo may prompt)..."
-        sudo wg-quick down "$VPN_FILE"
-    else
-        echo "Bringing tunnel '$(vpn_iface)' up (sudo may prompt)..."
-    fi
-    sudo wg-quick up "$VPN_FILE"
+    [[ -z "$VPN_DEV" ]] || vpn_root down
+    vpn_root up
     echo "OK. Tunnel '$(vpn_iface)' is up with fresh keys."
+}
+
+cmd_vpn() {
+    local sub="${1:-config}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        status)          vpn_status "$@" ;;
+        up)              vpn_up "$@" ;;
+        down)            vpn_down "$@" ;;
+        config)          cmd_vpn_config "$@" ;;
+        reload|restart)  cmd_vpn_reload "$@" ;;
+        *) die "Usage: isardvdi vpn status|up|down|config|reload" ;;
+    esac
 }
 
 cmd_deployments() {
@@ -2746,8 +2911,10 @@ cmd_template() {
 
 cmd_forget() {
     # Remove every secret this tool keeps on this computer, e.g. before leaving a shared one.
-    if [[ -f "$VPN_FILE" ]] && vpn_iface_up; then
-        die "The VPN tunnel is up and needs $VPN_FILE to come down. First run: sudo wg-quick down $VPN_FILE"
+    # Only wg-quick's tunnel needs the file to come down (NetworkManager keeps its own copy).
+    vpn_state
+    if [[ -f "$VPN_FILE" && -n "$VPN_DEV" && "$VPN_BY" == wg-quick ]]; then
+        die "The VPN tunnel is up and needs $VPN_FILE to come down. First run: isardvdi vpn down"
     fi
     ! secret_exists apikey "$APIKEY_FILE" || cmd_apikey revoke
     secret_clear token "$TOKEN_FILE"
@@ -2800,11 +2967,18 @@ COMMANDS
                                     desktop's settings, so -l doesn't apply.
                                     Anything after -- is forwarded to ssh (a remote
                                     command too: isardvdi ssh hermes -- uptime).
-    vpn-config                      Download the IsardVDI WireGuard config to
-                                    ~/.config/isardvdi-cli/isard-vpn.conf and print
-                                    the sudo command to bring it up.
-    vpn-reload                      Rotate keys server-side, refresh the config
-                                    and bounce the tunnel in one step. Needs sudo.
+    vpn status [--json]             Is the tunnel up, and who runs it (wg-quick, or a
+                                    NetworkManager connection made from the same config).
+    vpn up | vpn down               Bring the tunnel up or down: NetworkManager's through
+                                    nmcli, else wg-quick on the saved config, checked again
+                                    first, as root (sudo in a terminal, else the desktop's
+                                    password prompt). Up downloads the config if needed.
+    vpn config [--apply]            Download the WireGuard config (same keys) to
+                                    ~/.config/isardvdi-cli/isard-vpn.conf (also: vpn-config).
+                                    --apply restarts a wg-quick tunnel when it changed.
+    vpn reload                      Rotate keys server-side, refresh the config and
+                                    restart the tunnel (also: vpn-reload). Refused for a
+                                    NetworkManager tunnel: new keys would stop it.
     deployments                     List the deployments you own or co-own.
     students <deployment>           List a deployment's desktops: student, group, state,
                                     IP, desktop id.
@@ -2948,8 +3122,8 @@ ENVIRONMENT
                              start, ssh, console, rename --restart and
                              deployment --wait. Default: 180.
     ISARDVDI_MEDIA_TIMEOUT   Seconds 'media add' waits for the download. Default: 3600.
-    ISARDVDI_VPN_MTU         MTU written into the VPN config by 'vpn-config' and
-                             'vpn-reload' (1280-1500; 0 keeps the server's 1420).
+    ISARDVDI_VPN_MTU         MTU written into the VPN config by 'vpn config' and
+                             'vpn reload' (1280-1500; 0 keeps the server's 1420).
                              Default: 1280 on WSL, whose NAT drops bigger tunnel
                              packets (SSH hangs at key exchange); else the server's.
     SSH_USER                 Default username for 'isardvdi ssh'. Overrides the
@@ -2981,7 +3155,7 @@ EXAMPLES
     isardvdi ssh hermes
     isardvdi ssh hermes -l ubuntu -- -p 2222
     ISARDVDI_START_TIMEOUT=300 isardvdi ssh hermes
-    isardvdi vpn-reload
+    isardvdi vpn up
     isardvdi deployment start "ASIX2" --group 26-27_ASIX2 --wait
     isardvdi deployment stop "Ubuntu 24 server ASIX.1" -y
     isardvdi bastion on "Ubuntu 24 server ASIX.1"
@@ -3009,8 +3183,9 @@ case "$cmd" in
     help|-h|--help) ;;
     *)  secure_conf
         migrate_secrets
-        case "$cmd" in
-            init|login|apikey|api-key|forget) ;;
+        # Not for 'vpn status' either: the tray asks it each time its menu opens.
+        case "$cmd ${1:-}" in
+            "init "*|"login "*|"apikey "*|"api-key "*|"forget "*|"vpn status") ;;
             *) apikey_auto_renew; apikey_expiry_warning ;;
         esac ;;
 esac
@@ -3028,7 +3203,8 @@ case "$cmd" in
     get)             [[ $# -ge 1 ]] || die "Usage: isardvdi get </api/path>"
                      out=$(api_get "$1")   # JSON is re-printed by jq (which escapes control characters)
                      if jq -e . >/dev/null 2>&1 <<< "$out"; then jq . <<< "$out"; else sanitize "$out"; echo; fi ;;
-    vpn-config|vpn)  cmd_vpn_config "$@" ;;
+    vpn)             cmd_vpn "$@" ;;
+    vpn-config)      cmd_vpn_config "$@" ;;
     vpn-reload|vpn-restart) cmd_vpn_reload "$@" ;;
     deployments|deps) cmd_deployments "$@" ;;
     deployment|dep)  cmd_deployment "$@" ;;

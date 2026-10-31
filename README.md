@@ -101,8 +101,9 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `rename <name\|id> <new-name> [--restart]` | Rename a desktop; `--restart` stops a running one first and starts it again |
 | `extend <desktop>` | Postpone a started desktop's automatic shutdown |
 | `ssh <desktop> [-l user] [--bastion] [--no-start] [-- ssh-args]` | Auto-start if needed, then SSH in (a student's desktop: through the bastion) |
-| `vpn-config` | Download the WireGuard config, print the `wg-quick` command |
-| `vpn-reload` | Rotate keys and bounce the tunnel (**breaks a working tunnel if misused**) |
+| `vpn status [--json]`, `vpn up`, `vpn down` | The tunnel: wg-quick on the checked config (sudo, or the desktop's password prompt), or your NetworkManager connection |
+| `vpn config [--apply]` | Download the WireGuard config (same keys); `--apply` restarts a wg-quick tunnel if it changed |
+| `vpn reload` | Rotate keys and restart the tunnel (**breaks a working tunnel if misused**; refused for NetworkManager's) |
 | `deployments` | Deployments you own or co-own |
 | `students <deployment>` | A deployment's desktops: student, group, state, IP, id |
 | `deployment start\|stop\|extend <deployment>... [--group G]... [-y] [--wait] [--force]` | A whole class at once: every desktop of the deployments (or of a group), after asking |
@@ -149,13 +150,12 @@ See `isardvdi help` for environment variables (`ISARDVDI_START_TIMEOUT`, `SSH_US
 Desktops only get an IP if they were started with the **WireGuard** interface. Bring the tunnel up once:
 
 ```sh
-isardvdi vpn-config                 # prints the exact sudo wg-quick command
-sudo wg-quick up ~/.config/isardvdi-cli/isard-vpn.conf
+isardvdi vpn up                     # downloads the config, checks it, asks for your password
 isardvdi ssh my-desktop
 ```
 
 If ping works but `ssh` hangs at the key exchange, large packets are being dropped on the way:
-lower the tunnel MTU with `ISARDVDI_VPN_MTU=1280 isardvdi vpn-config` and restart the tunnel.
+lower the tunnel MTU with `ISARDVDI_VPN_MTU=1280 isardvdi vpn config --apply`.
 On WSL this is the default.
 
 ### Starting the class before it begins
