@@ -162,4 +162,31 @@ check "marks the text for clipboard histories, clears it after the time" \
 check "empty input: refuses" '! printf "\n" | python3 -I "$REPO/lib/secret_clipboard.py"'
 check "installed by install.sh" 'grep -q "secret_clipboard.py" "$REPO/install.sh"'
 
+echo "== 9 web link (set up the other computer)"
+REAL_HOME=$HOME
+HOME=$T/home; mkdir -p "$HOME/.ssh"
+printf 'Host work\n    HostName work.example\n' > "$HOME/.ssh/config"
+mkdir -p "$T/cfbin"; printf '#!/bin/sh\n' > "$T/cfbin/cloudflared"; chmod 755 "$T/cfbin/cloudflared"
+ssh() { printf '%s\n' "$@" > "$T/ssh-args"; return 0; }
+WEB_PEER=""
+( PATH="$T/cfbin:$PATH"; web_link jvidal@ssh.example.com --cloudflare ) > "$T/out" 2>&1; rc=$?
+check "writes the entry, keeps your other hosts" \
+    '[[ $rc == 0 ]] && grep -qx "Host isardvdi-peer" "$HOME/.ssh/config" && grep -qx "    HostName ssh.example.com" "$HOME/.ssh/config" && grep -qx "    User jvidal" "$HOME/.ssh/config" && grep -qx "Host work" "$HOME/.ssh/config"'
+check "through cloudflared, quoted path" 'grep -qx "    ProxyCommand \"$T/cfbin/cloudflared\" access ssh --hostname %h" "$HOME/.ssh/config"'
+check "private, remembered, tested" '[[ $(stat -c %a "$HOME/.ssh/config") == 600 ]] && grep -qx "WEB_PEER=isardvdi-peer" "$CONF_FILE" && grep -qx "isardvdi-peer" "$T/ssh-args" && grep -q Connected "$T/out"'
+( PATH="$T/cfbin:$PATH"; web_link other.example.com ) >/dev/null 2>&1
+check "run again: replaced, not added twice" '[[ $(grep -c "^Host isardvdi-peer" "$HOME/.ssh/config") == 1 ]] && grep -qx "    HostName other.example.com" "$HOME/.ssh/config" && ! grep -q ProxyCommand "$HOME/.ssh/config" && grep -qx "Host work" "$HOME/.ssh/config"'
+for bad in "-oProxyCommand=x" "a b" $'h\nProxyCommand x' "u@" "x;id"; do
+    ( web_link "$bad" ) >/dev/null 2>&1; rc=$?
+    check "destination '$(printf %q "$bad")' refused" '[[ $rc != 0 ]]'
+done
+mkdir -p "$T/empty"
+# shellcheck disable=SC2123  # no PATH on purpose: no cloudflared to find
+( PATH="$T/empty"; web_link h.example --cloudflare ) > "$T/out" 2>&1; rc=$?
+check "--cloudflare without cloudflared: says how to install" '[[ $rc != 0 ]] && grep -q "cloudflared isn.t installed" "$T/out"'
+ssh() { return 255; }
+( web_link h.example ) > "$T/out" 2>&1; rc=$?
+check "connection fails: says so" '[[ $rc != 0 ]] && grep -q "connection failed" "$T/out"'
+HOME=$REAL_HOME
+
 finish

@@ -1460,12 +1460,14 @@ cmd_web() {
         pull)       web_pull "$@" ;;
         push)       web_push "$@" ;;
         extension)  web_extension "$@" ;;
+        link)       web_link "$@" ;;
         token)      web_token "$@" ;;     # internal: what 'web pull' runs over SSH
         receive)    web_receive "$@" ;;   # internal: what 'web push' runs over SSH
         *) die "Usage: isardvdi web keepalive
        isardvdi web pull [--from [USER@]HOST] [--print]
        isardvdi web push [--to [USER@]HOST]
-       isardvdi web extension [DIR]" ;;
+       isardvdi web extension [DIR]
+       isardvdi web link [USER@]HOST [--cloudflare]" ;;
     esac
 }
 
@@ -1683,6 +1685,56 @@ web_push() {
     printf '%s\n' "$tkn" | web_ssh "$peer" receive || rc=$?
     [[ $rc -eq 0 ]] || die "Couldn't send the session to $peer (exit $rc; see above)."
     echo "Sent. On that computer: isardvdi web pull, then the extension's button."
+}
+
+web_link() {
+    # Sets up the other computer once: an entry 'isardvdi-peer' in ~/.ssh/config (through Cloudflare
+    # Access with --cloudflare, finding cloudflared or, on WSL, cloudflared.exe), remembered for
+    # 'web pull' and 'web push', and a test connection.
+    local dest="" cf=0 user host proxy="" cfbin block cfg="$HOME/.ssh/config" tmp
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cloudflare) cf=1; shift ;;
+            -*) die "Unknown flag: $1" ;;
+            *) [[ -z "$dest" ]] || die "Usage: isardvdi web link [USER@]HOST [--cloudflare]"; dest="$1"; shift ;;
+        esac
+    done
+    [[ -n "$dest" ]] || die "Usage: isardvdi web link [USER@]HOST [--cloudflare]   (the computer whose browser you share)"
+    [[ "$dest" =~ ^(([A-Za-z0-9][A-Za-z0-9._-]*)@)?([A-Za-z0-9][A-Za-z0-9.-]*)$ ]] \
+        || die "Not an SSH destination: $(sanitize "$dest")"
+    user="${BASH_REMATCH[2]}" host="${BASH_REMATCH[3]}"
+    if [[ $cf -eq 1 ]]; then
+        cfbin=$(command -v cloudflared || command -v cloudflared.exe || true)
+        [[ -n "$cfbin" ]] || die "cloudflared isn't installed here (nor cloudflared.exe from Windows). Install it:
+https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+        # ssh runs ProxyCommand with a shell: the path is quoted, and may not contain quoting characters.
+        [[ "$cfbin" != *[\"\$\`\\]* ]] || die "Unusual cloudflared path: $(sanitize "$cfbin")"
+        proxy="    ProxyCommand \"$cfbin\" access ssh --hostname %h"
+    fi
+    block="# isardvdi-cli: the other computer for 'isardvdi web pull/push' (isardvdi web link)
+Host isardvdi-peer
+    HostName $host${user:+
+    User $user}${proxy:+
+$proxy}
+# isardvdi-cli end"
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    [[ ! -L "$cfg" ]] || die "Refusing to rewrite $cfg: it is a symlink."
+    # Replace our previous block, keep everything else. Ours goes first: ssh uses the first match.
+    tmp=$( { printf '%s\n\n' "$block"; [[ -f "$cfg" ]] && awk '
+        /^# isardvdi-cli: the other computer/ {skip=1}
+        !skip {print}
+        /^# isardvdi-cli end/ {skip=0}' "$cfg"; } )
+    printf '%s\n' "$tmp" | write_secret "$cfg"
+    load_config
+    web_peer isardvdi-peer >/dev/null
+    echo "Wrote the SSH entry 'isardvdi-peer' ($dest${proxy:+, through Cloudflare Access}) to $cfg."
+    echo "Testing the connection (the first time, Cloudflare may open a sign-in page)..."
+    if ssh -o ConnectTimeout=60 -o ForwardAgent=no -o ForwardX11=no -- isardvdi-peer true </dev/null; then
+        echo "Connected. Now: isardvdi web pull  (or: isardvdi web push)"
+    else
+        die "The connection failed (see above). Fix it, then try: ssh isardvdi-peer true"
+    fi
 }
 
 web_extension() {
@@ -2745,6 +2797,11 @@ COMMANDS
     web push [--to [USER@]HOST]     Send this computer's web session to the other one
                                     (from this browser, or pasted: the extension's "Copy"
                                     button copies it); 'web pull' there installs it.
+    web link [USER@]HOST [--cloudflare]
+                                    Set up the other computer once: an SSH entry for it
+                                    (--cloudflare: through Cloudflare Access, with
+                                    cloudflared, or cloudflared.exe on WSL), remembered for
+                                    web pull/push, and a test connection.
     web extension [DIR]             Write the 'IsardVDI session' browser extension (Vivaldi,
                                     Chrome, Edge) for this portal, to load once with
                                     'Load unpacked'. On WSL: into your Windows home.
