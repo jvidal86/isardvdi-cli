@@ -2,6 +2,7 @@
 # Regression tests for the second and third audit passes, on fake data only.
 # shellcheck source=common.sh
 source "$(dirname "$0")/common.sh"
+wait_own() { TARGET_ID="$1" TARGET_OWN=1 TARGET_DEP=""; wait_target "$2" 1; }   # wait_target on your own desktop
 
 echo "== 1 VPN networks (the LAN is faked as 192.168.1.0/24 and 10.50.0.0/16)"
 local_networks() { printf '192.168.1.0/24\n10.50.0.0/16\n'; }
@@ -34,17 +35,17 @@ check "trailing comment doesn't change the routes" '( vpn_routes_confirmed "$(vp
 echo "== 2 polling: real deadlines, retry only temporary errors"
 sleep() { command sleep 0.01; }
 desktop_from_list() { echo x >> "$T/n"; [[ $(wc -l < "$T/n") -le 2 ]] && return 75; echo '{"status":"Started","ip":"10.2.0.8"}'; }
-got=$( ( wait_started 0cf16815-bffb-449b-8949-6757e049299a 10 ) 2>/dev/null )
+got=$( ( wait_own 0cf16815-bffb-449b-8949-6757e049299a 10 ) 2>/dev/null )
 check "two temporary failures, then ready" '[[ "$got" == 10.2.0.8 ]]'
 rm -f "$T/n"
 desktop_from_list() { echo x >> "$T/n"; return 1; }
-( wait_started 0cf16815-bffb-449b-8949-6757e049299a 10 ) >/dev/null 2>&1; rc=$?
+( wait_own 0cf16815-bffb-449b-8949-6757e049299a 10 ) >/dev/null 2>&1; rc=$?
 check "a hard error (e.g. 401) stops at once" '[[ $rc == 1 && $(wc -l < "$T/n") == 1 ]]'
 desktop_from_list() { command sleep 2; return 75; }
-start=$SECONDS; ( wait_started 0cf16815-bffb-449b-8949-6757e049299a 4 ) >/dev/null 2>&1; rc=$?
+start=$SECONDS; ( wait_own 0cf16815-bffb-449b-8949-6757e049299a 4 ) >/dev/null 2>&1; rc=$?
 check "slow failing polls respect a 4 s deadline (took $((SECONDS-start)) s, rc $rc)" '[[ $rc == 124 && $((SECONDS-start)) -le 7 ]]'
 desktop_from_list() { echo '{"status":"Starting"}'; }
-( wait_started 0cf16815-bffb-449b-8949-6757e049299a 2 ) >/dev/null 2>&1; rc=$?
+( wait_own 0cf16815-bffb-449b-8949-6757e049299a 2 ) >/dev/null 2>&1; rc=$?
 check "plain timeout returns 124" '[[ $rc == 124 ]]'
 unset -f sleep desktop_from_list
 check "api_call: no answer -> 75 (retry)" \

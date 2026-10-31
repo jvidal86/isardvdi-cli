@@ -3,17 +3,17 @@
 # shellcheck source=common.sh
 source "$(dirname "$0")/common.sh"
 U1=11111111-1111-1111-1111-111111111111
-find_desktop() { echo "$U1"; }
+resolve_target() { TARGET_ID="$U1" TARGET_OWN=1 TARGET_DEP=""; }
 api_call() { echo "$1 $2 ${3:-}" >> "$T/calls"; echo '{}'; }
 # The desktop's state lives in $T/state; a stop request turns it to Stopped, a start to Started.
-desktop_from_list() {
+desktop_now() {
     [[ -s "$T/calls" ]] && grep -q "/stop" "$T/calls" && ! grep -q "/start" "$T/calls" && echo Stopped > "$T/state"
     [[ -s "$T/calls" ]] && grep -q "/start" "$T/calls" && echo Started > "$T/state"
     local ip=null; [[ $(cat "$T/state") == Started ]] && ip='"10.2.0.9"'
     echo "{\"id\":\"$U1\",\"status\":\"$(cat "$T/state")\",\"ip\":$ip}"
 }
 sleep() { :; }
-run() { rm -f "$T/calls"; echo "$1" > "$T/state"; shift; ( cmd_rename "$@" ) >"$T/out" 2>&1; rc=$?; }
+run() { rm -f "$T/calls"; echo "$1" > "$T/state"; shift; ( set -e; cmd_rename "$@" ) >"$T/out" 2>&1; rc=$?; }
 calls() { cut -d' ' -f1,2 "$T/calls" 2>/dev/null | sed "s|/api/v4/item/desktop/$U1||" | tr '\n' ' '; }
 
 echo "== 1 names"
@@ -45,7 +45,7 @@ check "--restart: stop, edit, start in that order" '[[ $rc == 0 && "$(calls)" ==
 check "--restart: reports the new IP" 'grep -q "Started again: ip=10.2.0.9" "$T/out"'
 
 echo "== 4 never renames a desktop that didn't stop"
-desktop_from_list() { echo "{\"id\":\"$U1\",\"status\":\"Stopping\",\"ip\":null}"; }
+desktop_now() { echo "{\"id\":\"$U1\",\"status\":\"Stopping\",\"ip\":null}"; }
 START_TIMEOUT=0 run Started zeus "athena box" --restart
 check "timeout: stop sent, edit never sent" '[[ $rc != 0 && "$(calls)" == "PUT /stop " ]]'
 

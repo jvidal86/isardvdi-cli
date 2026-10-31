@@ -21,6 +21,14 @@ WARN_DAYS=14     # ... and warn when renewing keeps failing
 START_TIMEOUT="${ISARDVDI_START_TIMEOUT:-180}"
 MEDIA_TIMEOUT="${ISARDVDI_MEDIA_TIMEOUT:-3600}"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+# Name rule of the web UI's desktop/media/template forms (4-50 chars).
+NAME_RE='^[-_àèìòùáéíóúñçÀÈÌÒÙÁÉÍÓÚÑÇ .a-zA-Z0-9]{4,50}$'
+# Schedules: their list, their run log, and the systemd user units that run them.
+SCHED_FILE="$CONF_DIR/schedules.json"
+SCHED_LOG="$CONF_DIR/schedule.log"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SCHED_NAME_RE='^[a-z0-9][a-z0-9-]{0,31}$'
+DAYS=(Mon Tue Wed Thu Fri Sat Sun)
 # Set only by 'apikey create --from-browser'. Unset first so an inherited (exported) value is
 # never used, and the plain assignment later stays out of child processes' environments.
 # _ISARDVDI_LOGIN_TOKEN is internal too: inherited, it would force a SAML login.
@@ -38,9 +46,26 @@ require python3
 # sequences can rewrite the screen, set the clipboard, ...). JQ_CLEAN is the same for jq output.
 sanitize() { printf '%s' "$*" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed ':a;s/\xc2[\x80-\x9f]//g;ta'; }
 JQ_CLEAN='def clean: tostring | gsub("\\p{Cc}"; "?");'
+# Name matching, case-insensitive, for any value (null and numbers included): $x | has_text($q)
+# when $x contains $q, $x | is_text($q) when it equals it.
+JQ_MATCH='def lc: (. // "") | tostring | ascii_downcase;
+          def has_text($q): lc | contains($q | ascii_downcase);
+          def is_text($q): lc == ($q | ascii_downcase);'
+ID_RE='^[A-Za-z0-9_-]{1,64}$'   # a server id that may go into a URL (no / . { } [ ])
 
 valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; }
 valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+check_name() { [[ "$1" =~ $NAME_RE ]] || die "Invalid name \"$1\": 4-50 letters, digits, spaces, . _ -"; }
+fmt_epoch() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && date -d "@$1" '+%F %R' || echo "unknown"; }
+
+# Asks on the terminal (not stdin, which may be a pipe). $1=question. -y skips it (the caller).
+confirm() {
+    local ans
+    { [[ -r /dev/tty ]] && : < /dev/tty; } 2>/dev/null || die "No terminal to confirm on: add -y."
+    printf '%s [y/N] ' "$1" > /dev/tty
+    read -r ans < /dev/tty || ans=""
+    [[ "$ans" =~ ^[yYsS] ]]   # s: sí
+}
 
 private_path() {
     # Refuse a path another user owns; remove group/other permissions from ours (like ssh does).
@@ -331,6 +356,10 @@ poll() {
     printf '%s' "$out"
 }
 api_get() { api_call GET "$1"; }
+# The description_code of an API error message (as api_call prints it), or nothing.
+api_error_code() {
+    grep -oE '"description_code": ?"[a-z_]+"' <<< "$1" | grep -oE '[a-z_]+"$' | tr -d '"' || true
+}
 
 list_desktops_json() { api_get "/api/v4/items/desktops" | jq '.desktops'; }
 desktop_detail_json() { api_get "/api/v4/item/desktop/$1/get-info"; }
@@ -339,14 +368,16 @@ desktop_detail_json() { api_get "/api/v4/item/desktop/$1/get-info"; }
 desktop_from_list() { list_desktops_json | jq --arg id "$1" '.[] | select(.id == $id)'; }
 
 pick_by_name() {
-    # pick_by_name KIND JSON-ARRAY QUERY. Prints the id of the one item whose id equals QUERY or
-    # whose name contains it (case-insensitive); an exact name match wins over substrings.
-    local kind="$1" json="$2" query="$3" matches count
-    matches=$(printf '%s' "$json" | jq -r --arg q "$query" "$JQ_CLEAN"'
-        ([.[] | select(.id == $q or (.name // "" | tostring | ascii_downcase) == ($q | ascii_downcase))] | unique_by(.id)) as $exact
+    # pick_by_name KIND JSON-ARRAY QUERY [FIELD] [ID-RE]. Prints the id of the one item whose id
+    # equals QUERY or whose FIELD (default: name) contains it, case-insensitive; an exact match
+    # wins over substrings. Dies listing the candidates when there are none or several, or when
+    # the id doesn't match ID-RE (default: letters, digits, - and _).
+    local kind="$1" json="$2" query="$3" field="${4:-name}" id_re="${5:-$ID_RE}" matches count
+    matches=$(printf '%s' "$json" | jq -r --arg q "$query" --arg f "$field" "$JQ_CLEAN$JQ_MATCH"'
+        ([.[] | select(.id == $q or (.[$f] | is_text($q)))] | unique_by(.id)) as $exact
         | (if ($exact | length) == 1 then $exact
-           else [.[] | select(.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))] | unique_by(.id) end)
-        | .[] | [.id, .name] | map(clean) | @tsv')
+           else [.[] | select(.[$f] | has_text($q))] | unique_by(.id) end)
+        | .[] | [.id, .[$f]] | map(clean) | @tsv') || die "Unexpected answer from the server (not a list of ${kind}s)."
     count=$(printf '%s' "$matches" | grep -c . || true)
     if [[ "$count" == "0" ]]; then
         die "No $kind matches \"$query\""
@@ -357,8 +388,8 @@ pick_by_name() {
     fi
     local id
     id=$(printf '%s' "$matches" | cut -f1)
-    # Server ids go into URLs and messages: letters, digits, - and _ only (no / . { } [ ]).
-    [[ "$id" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "The server returned an invalid $kind id: $(sanitize "$id")"
+    # Server ids go into URLs and messages.
+    [[ "$id" =~ $id_re ]] || die "The server returned an invalid $kind id: $(sanitize "$id")"
     printf '%s' "$id"
 }
 
@@ -367,27 +398,11 @@ list_deployments_json() { api_get "/api/v4/items/deployments" | jq '.deployments
 deployment_desktops_json() { api_get "/api/v4/item/deployment/$1/videowall" | jq '.desktops // []'; }
 
 match_one() {
-    # match_one WHAT QUERY FIELD < JSON-ARRAY. Stdout: the id of the single element whose FIELD
-    # contains QUERY (case-insensitive); dies listing the candidates if there are none or several.
-    local what="$1" query="$2" field="$3" matches count
-    matches=$(jq -r --arg q "$query" --arg f "$field" '
-        ([.[] | select(.[$f] // "" | tostring | ascii_downcase == ($q | ascii_downcase))]) as $exact
-        | (if ($exact | length) == 1 then $exact
-           else [.[] | select(.[$f] // "" | tostring | ascii_downcase | contains($q | ascii_downcase))] end)
-        | .[] | [.id, .[$f]] | map(tostring) | @tsv')
-    count=$(printf '%s' "$matches" | grep -c . || true)
-    if [[ "$count" == "0" ]]; then
-        die "No $what matches \"$query\""
-    elif [[ "$count" != "1" ]]; then
-        err "Multiple ${what}s match \"$query\":"
-        err "$(sanitize "$matches")"
-        die "Be more specific (try the full name or the id)."
-    fi
-    local id
-    id=$(printf '%s' "$matches" | cut -f1)
-    # The id goes into URLs, ssh options and messages: accept only a UUID.
-    [[ "$id" =~ $UUID_RE ]] || die "The server returned an invalid $what id: $(sanitize "$id")"
-    printf '%s' "$id"
+    # match_one WHAT QUERY FIELD < JSON-ARRAY. pick_by_name on stdin, for UUID ids only: these
+    # (students' desktops, deployments) go into URLs and ssh options.
+    local json
+    json=$(cat)
+    pick_by_name "$1" "$json" "$2" "$3" "$UUID_RE"
 }
 
 find_deployment() {
@@ -435,8 +450,7 @@ find_media() {
     all=$(media_json)
     mine=$(printf '%s' "$all" | jq '[.[] | select(.source == "mine")]')
     local rc=0
-    printf '%s' "$mine" | jq -e --arg q "$1" 'any(.[]; .id == $q
-            or (.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase)))' >/dev/null || rc=$?
+    printf '%s' "$mine" | jq -e --arg q "$1" "$JQ_MATCH"'any(.[]; .id == $q or (.name | has_text($q)))' >/dev/null || rc=$?
     case $rc in
         0) pick_by_name "media item" "$mine" "$1"; return ;;
         1) ;;   # none of yours matches: look at the shared ones
@@ -448,15 +462,13 @@ find_media() {
     printf '%s' "$id"
 }
 templates_json() { api_get "/api/v4/items/templates" | jq '.templates? // .'; }
-find_template() { pick_by_name template "$(templates_json)" "$1"; }
 find_group() {
     # Group search used by the web UI's sharing picker (works for non-admin roles). Exact name or
     # id only: a prefix like "ASIX" must not quietly share with "ASIX2 Mati".
     local found exact id
     found=$(api_call POST "/api/v4/items/alloweds/term/groups" \
         "$(jq -nc --arg t "$1" '{table: "groups", term: $t}')") || exit 1
-    exact=$(printf '%s' "$found" | jq --arg q "$1" \
-        '[.[] | select(.id == $q or (.name // "" | tostring | ascii_downcase) == ($q | ascii_downcase))]') \
+    exact=$(printf '%s' "$found" | jq --arg q "$1" "$JQ_MATCH"'[.[] | select(.id == $q or (.name | is_text($q)))]') \
         || die "Unexpected answer to the group search."
     if [[ $(jq length <<< "$exact") != 1 ]]; then
         err "No single group named exactly \"$1\". Groups found:"
@@ -468,52 +480,9 @@ find_group() {
     printf '%s' "$id"
 }
 
-# Name rule of the web UI's media/template forms (4-50 chars).
-NAME_RE='^[-_àèìòùáéíóúñçÀÈÌÒÙÁÉÍÓÚÑÇ .a-zA-Z0-9]{4,50}$'
-check_name() { [[ "$1" =~ $NAME_RE ]] || die "Invalid name \"$1\": 4-50 letters, digits, spaces, . _ -"; }
 
 vpn_iface() { basename "$VPN_FILE" .conf; }
 vpn_iface_up() { ip link show "$(vpn_iface)" >/dev/null 2>&1; }
-
-wait_started() {
-    # $1=id, $2=timeout-seconds. Prints IP to stdout when ready, exits 1 on timeout.
-    # Prints a heartbeat to stderr every 10 s so the user knows it's still alive.
-    # The deadline is in real seconds (SECONDS), however long each request takes. Returns 124 on
-    # timeout; exits on an error that retrying won't fix.
-    local id="$1" timeout="${2:-60}" start=$SECONDS shown=-10 d state ip last_state=""
-    while (( SECONDS - start < timeout )); do
-        d=$(poll desktop_from_list "$id") || exit $?
-        state=$(desktop_state "$d")
-        ip=$(desktop_ip "$d")
-        if [[ "$state" == "Started" && "$ip" != "null" ]]; then
-            printf '%s' "$ip"
-            return 0
-        fi
-        if [[ "$state" != "$last_state" ]] || (( SECONDS - start - shown >= 10 )); then
-            printf '  [%3ds/%ds] state=%s ip=%s\n' "$((SECONDS - start))" "$timeout" "$state" "$ip" >&2
-            last_state="$state" shown=$((SECONDS - start))
-        fi
-        sleep 1
-    done
-    return 124
-}
-
-wait_state_started() {
-    # $1=id, $2=timeout-seconds. Like wait_started, but only waits for state "Started" (no IP
-    # needed) and uses get-info, which also works for students' desktops in your deployments.
-    local id="$1" timeout="${2:-60}" start=$SECONDS shown=-10 d state last_state=""
-    while (( SECONDS - start < timeout )); do
-        d=$(poll desktop_detail_json "$id") || exit $?
-        state=$(desktop_state "$d")
-        [[ "$state" == "Started" ]] && return 0
-        if [[ "$state" != "$last_state" ]] || (( SECONDS - start - shown >= 10 )); then
-            printf '  [%3ds/%ds] state=%s\n' "$((SECONDS - start))" "$timeout" "$state" >&2
-            last_state="$state" shown=$((SECONDS - start))
-        fi
-        sleep 1
-    done
-    return 124
-}
 
 # The desktop a command acts on: <desktop> (yours, by name or id; any id works) or
 # <deployment> <student> (a student's desktop in a deployment you own). Sets TARGET_ID,
@@ -522,15 +491,21 @@ wait_state_started() {
 resolve_target() {
     # Explicit exits: called as "resolve_target ... || die", set -e is off in here.
     TARGET_DEP="" TARGET_OWN=0 TARGET_ID=""
+    local list own
     case $# in
-        1) TARGET_ID=$(find_desktop "$1") || exit 1 ;;
+        1) list=$(list_desktops_json) || exit 1
+           if [[ "$1" =~ $UUID_RE ]]; then
+               TARGET_ID="$1"
+           else
+               TARGET_ID=$(pick_by_name desktop "$list" "$1" name "$UUID_RE") || exit 1
+           fi ;;
         2) TARGET_DEP=$(find_deployment "$1") || exit 1
-           TARGET_ID=$(deployment_desktops_json "$TARGET_DEP" | match_one "student desktop" "$2" user_name) || exit 1 ;;
+           TARGET_ID=$(deployment_desktops_json "$TARGET_DEP" | match_one "student desktop" "$2" user_name) || exit 1
+           list=$(list_desktops_json) || exit 1 ;;
         *) return 2 ;;
     esac
     [[ "$TARGET_ID" =~ $UUID_RE ]] || die "Invalid desktop id: $(sanitize "$TARGET_ID")"
-    local own
-    own=$(list_desktops_json | jq --arg id "$TARGET_ID" 'any(.[]; .id == $id)') || exit 1
+    own=$(jq --arg id "$TARGET_ID" 'any(.[]; .id == $id)' <<< "$list") || exit 1
     [[ "$own" == true ]] && TARGET_OWN=1
     return 0
 }
@@ -569,13 +544,29 @@ wait_target() {
     return 124
 }
 
-# Asks on the terminal (not stdin, which may be a pipe). $1=question. -y skips it (the caller).
-confirm() {
-    local ans
-    { [[ -r /dev/tty ]] && : < /dev/tty; } 2>/dev/null || die "No terminal to confirm on: add -y."
-    printf '%s [y/N] ' "$1" > /dev/tty
-    read -r ans < /dev/tty || ans=""
-    [[ "$ans" =~ ^[yYsS] ]]   # s: sí
+ensure_started() {
+    # ensure_started NO_START NEED_IP. Starts TARGET_ID if it is Stopped or Failed (refused when
+    # NO_START=1), then waits until it is Started, and has its IP when NEED_IP=1. Stdout: the IP,
+    # or "null". Returns 124 on timeout, for the caller to say what to check.
+    # Explicit exits: callers use "ip=$(ensure_started ...) || rc=$?", where set -e is off.
+    local no_start="$1" need_ip="$2" d state ip
+    d=$(desktop_now) || exit $?
+    state=$(desktop_state "$d")
+    ip=$(desktop_ip "$d")
+    if [[ "$state" == Started ]] && [[ $need_ip -eq 0 || "$ip" != null ]]; then
+        printf '%s' "$ip"
+        return 0
+    fi
+    if [[ "$state" != Started ]]; then
+        [[ $no_start -eq 0 ]] || die "Desktop not Started (state=$state). --no-start requested, refusing to start."
+        if [[ "$state" == Stopped || "$state" == Failed ]]; then
+            echo "Desktop is $state — starting it..." >&2
+            api_call PUT "/api/v4/item/desktop/$TARGET_ID/start" >/dev/null || exit $?
+        else
+            echo "Desktop is $state — waiting for it to come up..." >&2
+        fi
+    fi
+    wait_target "$START_TIMEOUT" "$need_ip"
 }
 
 cmd_init() {
@@ -659,7 +650,7 @@ cmd_start() {
 cmd_rename() {
     # The server only edits a stopped (or failed) desktop: --restart stops a running one, renames
     # it and starts it again. A desktop that was already stopped stays stopped.
-    local restart=0 target="" name="" id d state start ip
+    local restart=0 target="" name="" id d state start ip rc
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --restart) restart=1; shift ;;
@@ -670,8 +661,9 @@ cmd_rename() {
     done
     [[ -n "$name" ]] || die "Usage: isardvdi rename <name|id> <new-name> [--restart]"
     check_name "$name"
-    id=$(find_desktop "$target")
-    d=$(desktop_from_list "$id")
+    resolve_target "$target"
+    id="$TARGET_ID"
+    d=$(desktop_now)
     [[ -n "$d" ]] || die "Desktop $id not found"
     state=$(desktop_state "$d")
     if [[ "$state" == Stopped || "$state" == Failed ]]; then
@@ -686,7 +678,7 @@ Stop it first (isardvdi stop $id), or add --restart."
             (( SECONDS - start < START_TIMEOUT )) \
                 || die "Timed out after $START_TIMEOUT s waiting for $id to stop; nothing was renamed."
             sleep 2
-            d=$(poll desktop_from_list "$id") || exit $?
+            d=$(poll desktop_now) || exit $?
             state=$(desktop_state "$d")
         done
     fi
@@ -694,8 +686,10 @@ Stop it first (isardvdi stop $id), or add --restart."
     echo "Renamed $id to \"$name\"."
     if [[ $restart -eq 1 ]]; then
         api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
-        ip=$(wait_started "$id" "$START_TIMEOUT") \
-            || die "Renamed, but it isn't Started with an IP after $START_TIMEOUT s. Check: isardvdi status $id"
+        rc=0
+        ip=$(wait_target "$START_TIMEOUT" "$TARGET_OWN") || rc=$?
+        [[ $rc -ne 124 ]] || die "Renamed, but it isn't Started after $START_TIMEOUT s. Check: isardvdi status $id"
+        [[ $rc -eq 0 ]] || exit "$rc"
         echo "Started again: ip=$ip"
     fi
 }
@@ -733,7 +727,7 @@ cmd_extend() {
         fi
         return
     fi
-    code=$(grep -oE '"description_code": ?"[a-z_]+"' <<<"$errmsg" | grep -oE '[a-z_]+"$' | tr -d '"') || code=""
+    code=$(api_error_code "$errmsg")
     case "$code" in
         desktop_not_started)            die "Can't extend: the desktop is not started." ;;
         desktop_no_scheduled_shutdown)  die "Can't extend: this desktop has no auto-shutdown timer." ;;
@@ -748,7 +742,8 @@ cmd_viewer() {
     # one-time console password, so it is created mode 600 and its content is never printed.
     [[ $# -ge 1 ]] || die "Usage: isardvdi viewer <name|id> [FILE.vv]"
     local id out body path vv
-    id=$(find_desktop "$1")
+    resolve_target "$1"
+    id="$TARGET_ID"
     # Not $TMPDIR//tmp: another user could plant a file or symlink at a predictable name there.
     out="${2:-${XDG_RUNTIME_DIR:-$CONF_DIR}/isard-$id.vv}"
     [[ ! -L "$out" ]] || die "Refusing to write $out: it is a symlink."
@@ -788,8 +783,8 @@ cmd_ssh() {
         0) die "$usage" ;;
         1) ;;
         2) # Older versions passed a second word to ssh as the remote command.
-           if [[ ! "${pos[0]}" =~ $UUID_RE ]] && ! list_deployments_json | jq -e --arg q "${pos[0]}" \
-                'any(.[]; .name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))' >/dev/null; then
+           if [[ ! "${pos[0]}" =~ $UUID_RE ]] && ! list_deployments_json \
+                | jq -e --arg q "${pos[0]}" "$JQ_MATCH"'any(.[]; .name | has_text($q))' >/dev/null; then
                die "No deployment matches \"${pos[0]}\". To run a command on a desktop, put it after --:
     isardvdi ssh $(printf '%q' "${pos[0]}") -- $(printf '%q' "${pos[1]}")"
            fi ;;
@@ -802,29 +797,10 @@ $usage" ;;
         ssh_bastion "$user" "$no_start" "${args[@]}"
     fi
 
-    local id="$TARGET_ID" d state ip
-    d=$(desktop_from_list "$id")
-    state=$(desktop_state "$d")
-    ip=$(desktop_ip "$d")
-
-    if [[ "$state" != "Started" || "$ip" == "null" ]]; then
-        if [[ $no_start -eq 1 ]]; then
-            die "Desktop not Started (state=$state). --no-start requested, refusing to start."
-        fi
-        case "$state" in
-            Stopped|Failed)
-                echo "Desktop is $state — starting it..." >&2
-                api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
-                ;;
-            *)
-                echo "Desktop is $state — waiting for it to come up..." >&2
-                ;;
-        esac
-        local rc=0
-        ip=$(wait_started "$id" "$START_TIMEOUT") || rc=$?
-        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started with an IP"
-        [[ $rc -eq 0 ]] || exit "$rc"
-    fi
+    local id="$TARGET_ID" ip rc=0
+    ip=$(ensure_started "$no_start" 1) || rc=$?
+    [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started with an IP"
+    [[ $rc -eq 0 ]] || exit "$rc"
 
     # The IP comes from the server: check it before it reaches a shell or ssh.
     valid_ipv4 "$ip" || die "The server returned an invalid IP address: $(sanitize "$ip")"
@@ -1078,14 +1054,14 @@ deployments_matching() {
     local all q deps
     all=$(list_deployments_json) || exit 1
     for q in "$@"; do
-        jq -e --arg q "$q" --arg re "$UUID_RE" 'any(.[]; .id == $q
-            or (($q | test($re) | not) and (.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))))' \
+        jq -e --arg q "$q" --arg re "$UUID_RE" "$JQ_MATCH"'any(.[]; .id == $q
+            or (($q | test($re) | not) and (.name | has_text($q))))' \
             >/dev/null <<< "$all" || die "No deployment matches \"$q\". See: isardvdi deployments"
     done
     # A query that is an id (as the schedules store) picks that deployment only, never one whose
     # name happens to contain it.
-    deps=$(jq -c --arg re "$UUID_RE" --args '[.[] | . as $d | select(any($ARGS.positional[]; . as $q | $d.id == $q
-            or (($q | test($re) | not) and ($d.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase)))))]' \
+    deps=$(jq -c --arg re "$UUID_RE" --args "$JQ_MATCH"'[.[] | . as $d | select(any($ARGS.positional[]; . as $q
+            | $d.id == $q or (($q | test($re) | not) and ($d.name | has_text($q)))))]' \
             "$@" <<< "$all")
     # Ids go into URLs.
     jq -e --arg re "$UUID_RE" 'all(.[]; .id | tostring | test($re))' >/dev/null <<< "$deps" \
@@ -1106,13 +1082,15 @@ cmd_deployment() {
 
 deployment_bulk() {
     local action="$1"; shift
-    local yes=0 force=0 wait=0 queries=() groups=()
+    local yes=0 force=0 wait=0 summary=0 queries=() groups=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -y|--yes) yes=1; shift ;;
             --force)  [[ "$action" == stop ]] || die "--force only applies to stop"; force=1; shift ;;
             --wait)   [[ "$action" != extend ]] || die "--wait only applies to start and stop"; wait=1; shift ;;
             --group)  [[ $# -ge 2 ]] || die "--group needs a name"; groups+=("$2"); shift 2 ;;
+            # Internal (schedule run): end with "SUMMARY ok=N failed=M", whatever the wording above.
+            --summary) summary=1; shift ;;
             -*) die "Unknown flag: $1" ;;
             *) queries+=("$1"); shift ;;
         esac
@@ -1128,9 +1106,8 @@ deployment_bulk() {
         dep=$(jq -r --argjson i "$i" '.[$i].id' <<< "$deps")
         name=$(jq -r --argjson i "$i" "$JQ_CLEAN"' .[$i].name | clean' <<< "$deps")
         desktops=$(deployment_desktops_json "$dep") || exit 1
-        selected=$(jq -c --args '[.[] | select(($ARGS.positional | length) == 0
-            or (.group_name // "" | tostring | ascii_downcase) as $g
-               | any($ARGS.positional[]; ascii_downcase as $q | $g | contains($q)))]' \
+        selected=$(jq -c --args "$JQ_MATCH"'[.[] | . as $d | select(($ARGS.positional | length) == 0
+            or any($ARGS.positional[]; . as $q | $d.group_name | has_text($q)))]' \
             ${groups[@]+"${groups[@]}"} <<< "$desktops")
         todo=$(jq -c --arg a "$action" '[.[] | select(.status as $s
             | if $a == "start" then ($s == "Stopped" or $s == "Failed")
@@ -1149,8 +1126,7 @@ deployment_bulk() {
         for g in "${groups[@]}"; do
             local hit=0
             for (( i = 0; i < n; i++ )); do
-                jq -e --arg q "$g" \
-                    'any(.[]; .group_name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))' \
+                jq -e --arg q "$g" "$JQ_MATCH"'any(.[]; .group_name | has_text($q))' \
                     >/dev/null <<< "${dep_desk[$i]}" && { hit=1; break; }
             done
             [[ $hit -eq 1 ]] || die "No desktop of these deployments is in a group matching \"$g\". Groups: $(
@@ -1163,6 +1139,7 @@ deployment_bulk() {
     case "$action" in start) verb="Start" ;; stop) verb="Stop" ;; extend) verb="Extend the auto-shutdown of" ;; esac
     if (( total == 0 )); then
         printf 'Nothing to do: no desktop to %s in:\n%s' "$action" "$plan"
+        [[ $summary -eq 0 ]] || echo "SUMMARY ok=0 failed=0"
         return 0
     fi
     printf '%s %d desktop(s):\n%s' "$verb" "$total" "$plan" >&2
@@ -1201,7 +1178,7 @@ deployment_bulk() {
                 fi
             else
                 failed=$((failed + 1))
-                code=$(grep -oE '"description_code": ?"[a-z_]+"' <<< "$errmsg" | grep -oE '[a-z_]+"$' | tr -d '"') || true
+                code=$(api_error_code "$errmsg")
                 err "  $who: ${code:-$errmsg}"
             fi
         done < <(jq -r "$JQ_CLEAN"' .[] | [.id, (.user_name // .name // "?")] | map(clean) | @tsv' <<< "$todo")
@@ -1213,6 +1190,7 @@ deployment_bulk() {
         stop)   echo "Stop requested for $ok desktop(s)$tail" ;;
         extend) echo "Auto-shutdown extended for $ok desktop(s)$tail" ;;
     esac
+    [[ $summary -eq 0 ]] || echo "SUMMARY ok=$ok failed=$failed"
     [[ $failed -eq 0 ]] || [[ $ok -gt 0 ]] || exit 1
 
     if [[ $wait -eq 1 && $ok -gt 0 ]]; then
@@ -1298,32 +1276,18 @@ desktop's settings in the portal (its credentials), not as one you choose."
     [[ -n "$key" ]] || die "Your portal profile has no SSH key, and the bastion only lets in that key.
 Add your public key: isardvdi bastion key ~/.ssh/id_ed25519.pub"
 
-    # The bastion only connects to a Started desktop that has its VPN IP.
-    local d state ip
-    d=$(desktop_now)
-    state=$(desktop_state "$d")
-    if [[ "$state" != Started ]]; then
-        [[ $no_start -eq 0 ]] || die "Desktop not Started (state=$state). --no-start requested, refusing to start."
-        if [[ "$state" == Stopped || "$state" == Failed ]]; then
-            echo "Desktop is $state — starting it..." >&2
-            api_call PUT "/api/v4/item/desktop/$TARGET_ID/start" >/dev/null
-        else
-            echo "Desktop is $state — waiting for it to come up..." >&2
-        fi
-    fi
-    if [[ $TARGET_OWN -eq 1 || -n "$TARGET_DEP" ]]; then
-        rc=0
-        ip=$(wait_target "$START_TIMEOUT" 1) || rc=$?
-        [[ $rc -ne 124 ]] || die "No VPN IP after ${START_TIMEOUT} s. The bastion reaches the desktop through its
+    # The bastion only connects to a Started desktop that has its VPN IP. A student's desktop
+    # given by id alone has no known deployment, so no IP to watch: Started is enough there.
+    local need_ip=0
+    [[ $TARGET_OWN -eq 1 || -n "$TARGET_DEP" ]] && need_ip=1
+    rc=0
+    ensure_started "$no_start" "$need_ip" >/dev/null || rc=$?
+    if [[ $rc -eq 124 && $need_ip -eq 1 ]]; then
+        die "No VPN IP after ${START_TIMEOUT} s. The bastion reaches the desktop through its
 WireGuard VPN card: check inside it that the card is up and on DHCP (isardvdi console ...)."
-        [[ $rc -eq 0 ]] || exit "$rc"
-    else
-        # A student's desktop given by id: no deployment, so no IP to watch. Started is enough.
-        rc=0
-        wait_target "$START_TIMEOUT" 0 >/dev/null || rc=$?
-        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for the desktop to start."
-        [[ $rc -eq 0 ]] || exit "$rc"
     fi
+    [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for the desktop to start."
+    [[ $rc -eq 0 ]] || exit "$rc"
 
     local target host port
     read -r target host port <<< "$conn"
@@ -1484,11 +1448,6 @@ bastion_key() {
 # groups: [...], enabled}]. Each schedule gets a timer that runs 'isardvdi schedule run NAME'.
 # Running twice (this computer and a laptop, say) is harmless: only Stopped/Failed desktops are
 # started, and IsardVDI ignores a start of a desktop that is already starting or started.
-SCHED_FILE="$CONF_DIR/schedules.json"
-SCHED_LOG="$CONF_DIR/schedule.log"
-SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-SCHED_NAME_RE='^[a-z0-9][a-z0-9-]{0,31}$'
-DAYS=(Mon Tue Wed Thu Fri Sat Sun)
 
 sched_json() { if [[ -f "$SCHED_FILE" ]]; then cat "$SCHED_FILE"; else echo '[]'; fi; }
 sched_save() {
@@ -1791,20 +1750,23 @@ sched_run() {
             else
                 args=("${ids[@]}")
                 while IFS= read -r g; do [[ -n "$g" ]] && args+=(--group "$g"); done < <(jq -r '.groups[]' <<< "$s")
-                out=$( (deployment_bulk start "${args[@]}" -y) 2>&1 ) || rc=$?
+                out=$( (deployment_bulk start "${args[@]}" -y --summary) 2>&1 ) || rc=$?
             fi
         else
             rc=1 out="$all"
         fi
-        printf '%s\n' "$out"
+        printf '%s\n' "$out" | grep -v '^SUMMARY ' || true
         [[ $rc -ne 0 && $from_timer -eq 1 && $attempt -lt 4 ]] || break
         sleep 30
     done
     [[ -z "$missing" ]] || missing=" Not on the server any more: $missing."
+    local n_failed
+    n_failed=$(printf '%s\n' "$out" | sed -n 's/^SUMMARY ok=[0-9]* failed=\([0-9]*\)$/\1/p' | tail -n 1)
     if [[ $rc -eq 0 ]]; then
+        # The wording is for the log; the decision comes from the SUMMARY line.
         msg=$(printf '%s\n' "$out" | grep -E '^(Start requested|Nothing to do)' | head -n 1) || msg=""
         [[ "$msg" == "Nothing to do"* ]] && msg="nothing to do: all already running"
-        if [[ "$msg" == *failed* || -n "$missing" ]]; then
+        if [[ "${n_failed:-0}" != 0 || -n "$missing" ]]; then
             sched_log "$name" "PARTIAL: ${msg:-done}$missing"
             sched_notify "$name" "Some desktops did not start. See: isardvdi schedule list" critical
         else
@@ -1889,22 +1851,10 @@ cmd_console() {
     # copy while the console is open: share the clipboard only with your own, unless asked.
     [[ -n "$clipboard" ]] || clipboard=$TARGET_OWN
 
-    local state
-    state=$(desktop_state "$(desktop_detail_json "$id")")
-    if [[ "$state" != "Started" ]]; then
-        [[ $no_start -eq 0 ]] || die "Desktop not Started (state=$state). --no-start requested, refusing to start."
-        case "$state" in
-            Stopped|Failed)
-                echo "Desktop is $state — starting it..." >&2
-                api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
-                ;;
-            *) echo "Desktop is $state — waiting for it to come up..." >&2 ;;
-        esac
-        local rc=0
-        wait_state_started "$id" "$START_TIMEOUT" || rc=$?
-        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started"
-        [[ $rc -eq 0 ]] || exit "$rc"
-    fi
+    local rc=0
+    ensure_started "$no_start" 0 >/dev/null || rc=$?
+    [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for $id to be Started"
+    [[ $rc -eq 0 ]] || exit "$rc"
 
     if [[ "$viewer_type" == "file-rdpgw" ]]; then
         # The RDP gateway connects to the guest's IP, which only exists on the WireGuard interface
@@ -1997,7 +1947,6 @@ networks in the web UI (desktop → Edit → Hardware), or use the SPICE console
     fi
 }
 
-fmt_epoch() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && date -d "@$1" '+%F %R' || echo "unknown"; }
 
 check_portal_token() {
     # check_portal_token TOKEN [USER-ID]. Succeeds for a portal login token (not an API key) that
@@ -2442,7 +2391,8 @@ COMMANDS
                                     NAME (repeatable). Lists what it will do and asks
                                     first (-y: don't ask). --wait: wait until all are
                                     Started / Stopped. --force (stop): stop at once,
-                                    without a clean shutdown of the guest.
+                                    without a clean shutdown of the guest (with --group,
+                                    as 'stop --force': the stop is sent twice).
     bastion status <deployment> [<student>] | --desktop <desktop>
                                     Whether SSH through the bastion is on.
     bastion on|off <deployment>... [--port N] | --desktop <desktop> [--port N]
@@ -2592,6 +2542,9 @@ SEE ALSO
     isardvdi(1), wg-quick(8), ssh(1)
 EOF
 }
+
+# Sourced (the tests do: source bin/isardvdi) the file only defines its functions.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 cmd="${1:-help}"
 if [[ $# -gt 0 ]]; then shift; fi

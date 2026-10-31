@@ -7,7 +7,7 @@ mkdir -p "$T/xdg/isardvdi-cli" "$T/helpers"
 printf 'URL=https://127.0.0.1:1\nUSERNAME=\nSSH_USER=isard\n' > "$T/xdg/isardvdi-cli/config"
 export XDG_CONFIG_HOME="$T/xdg"
 # shellcheck disable=SC1090,SC1091
-source <(sed -n '1,/^cmd="\${1:-help}"/p' "$REPO/bin/isardvdi" | head -n -1)
+source "$REPO/bin/isardvdi"   # sourced, it only defines the functions
 set +e
 # Keyring items made by the tests are all called "selftest".
 trap 'keyring_ok && secret-tool clear service isardvdi-cli item selftest 2>/dev/null; rm -rf "$T"' EXIT

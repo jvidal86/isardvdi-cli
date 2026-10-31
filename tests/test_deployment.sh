@@ -34,6 +34,12 @@ api_call() {
     esac
 }
 sleep() { :; }
+# Runs "$@" in a new session (no terminal to confirm on): the CLI loaded as usual, then this
+# test's mocks and variables on top.
+no_tty() {
+    setsid -w bash -c 'source "$1"; set +e; source /dev/stdin; shift; "$@"' _ "$REPO/bin/isardvdi" "$@" \
+        <<< "$(declare -f; declare -p T TG S1 S2 S3 D1 D2 MINE BASTION_ACTIVE PROFILE_KEY 2>/dev/null)"
+}
 run() { rm -f "$T/calls"; ( set -e; "$@" ) >"$T/out" 2>&1; rc=$?; }
 calls() { cut -d' ' -f1,2 "$T/calls" 2>/dev/null | tr '\n' ' '; }
 
@@ -61,7 +67,7 @@ check "extend: started desktops only, no confirmation needed" '[[ $rc == 0 && "$
 
 echo "== 3 deployment: safety"
 rm -f "$T/calls"
-( setsid -w bash -c 'source "$1"; cmd_deployment stop "ASIX.1"' _ /dev/stdin <<< "$(declare -f); $(declare -p T D1 S1 S2 S3 UUID_RE JQ_CLEAN 2>/dev/null)" ) </dev/null >"$T/out" 2>&1; rc=$?
+no_tty cmd_deployment stop "ASIX.1" >"$T/out" 2>&1; rc=$?
 check "no terminal and no -y: refused, nothing sent" '[[ $rc != 0 && ! -e "$T/calls" ]] && grep -q -- "-y" "$T/out"'
 run cmd_deployment stop "nothing-like-this" -y
 check "no matching deployment: refused" '[[ $rc != 0 && ! -e "$T/calls" ]]'
@@ -135,7 +141,8 @@ echo "== 5b the bastion host is remembered"
 check "first use remembered" '[[ "$(cat "$BASTION_HOST_FILE")" == "bastion.example.cat:443" ]]'
 BASTION_ACTIVE='{"bastion_enabled":true,"ssh":{"enabled":true,"port":22},"id":"'$TG'","bastion_domain":"evil.example.org","bastion_ssh_port":"443"}'
 deployment_desktops_json() { echo "[{\"id\":\"$S1\",\"user_name\":\"Abdellah A\",\"status\":\"Started\",\"ip\":\"10.2.1.1\"}]"; }
-( setsid -w bash -c 'source /dev/stdin; sshrun "ASIX.1" abdellah; cat "$T/out"; exit $rc' <<< "$(declare -f); $(declare -p T TG S1 D1 S2 S3 MINE UUID_RE JQ_CLEAN BASTION_ACTIVE PROFILE_KEY BASTION_HOST_FILE START_TIMEOUT CONF_DIR 2>/dev/null); set +u" ) </dev/null >"$T/tofu" 2>&1; rc=$?
+sh_tofu() { sshrun "ASIX.1" abdellah; cat "$T/out"; return $rc; }
+no_tty sh_tofu >"$T/tofu" 2>&1; rc=$?
 check "a different bastion host, no terminal to confirm: refused, ssh not run" '[[ $rc != 0 && ! -e "$T/ssh-args" ]] && grep -q "different bastion" "$T/tofu" && grep -q "add -y\|No terminal" "$T/tofu" && [[ "$(cat "$BASTION_HOST_FILE")" == "bastion.example.cat:443" ]]'
 BASTION_ACTIVE='{"bastion_enabled":true,"ssh":{"enabled":true,"port":22},"id":"'$TG'","bastion_domain":"bastion.example.cat","bastion_ssh_port":"0443"}'
 sshrun "ASIX.1" abdellah

@@ -153,6 +153,18 @@ rm -f "$T/notify"
 run cmd_schedule run aso
 check "server text never reaches the notification" '[[ $rc != 0 ]] && ! grep -q "evil" "$T/notify" && grep -q "FAILED to start" "$T/notify"'
 api_call() { echo "$1 $2 ${3:-}" >> "$T/calls"; echo '{}'; }
+# One desktop refused, one started: PARTIAL, decided from the SUMMARY line, never shown.
+cmd_schedule edit aso --group asix2 >/dev/null 2>&1
+deployment_desktops_json() {
+    [[ "$1" == "$D1" ]] && echo "[{\"id\":\"$S1\",\"user_name\":\"Pol A\",\"group_name\":\"26-27_ASIX2\",\"status\":\"Stopped\"},
+                                {\"id\":\"$S2\",\"user_name\":\"Pau B\",\"group_name\":\"26-27_ASIX2\",\"status\":\"Stopped\"}]" || echo '[]'
+}
+api_call() { echo "$1 $2" >> "$T/calls"; if [[ "$2" == *"$S2"* ]]; then echo '{"description_code": "quota_exceeded"}' >&2; return 1; fi; echo '{}'; }
+rm -f "$T/notify"
+run cmd_schedule run aso
+check "one of two refused: PARTIAL, critical" '[[ $rc == 0 ]] && tail -n 1 "$SCHED_LOG" | grep -q "PARTIAL: Start requested for 1 desktop(s), 1 failed" && grep -q "|critical$" "$T/notify"'
+check "the SUMMARY line is never shown" '! grep -q "^SUMMARY" "$T/out"'
+api_call() { echo "$1 $2 ${3:-}" >> "$T/calls"; echo '{}'; }
 # A deployment whose name contains a stored id is not started by that id.
 list_deployments_json() { echo "[{\"id\":\"$D1\",\"name\":\"w\"},{\"id\":\"$D2\",\"name\":\"Windows 11 uniquie SID ASIX2\"},{\"id\":\"d3333333-3333-3333-3333-333333333333\",\"name\":\"copy of $D1\"}]"; }
 deployment_desktops_json() { echo "[{\"id\":\"$S1\",\"user_name\":\"Pol A\",\"group_name\":\"26-27_ASIX2\",\"status\":\"Stopped\"}]"; }

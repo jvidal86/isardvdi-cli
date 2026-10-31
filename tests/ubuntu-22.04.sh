@@ -16,7 +16,7 @@ apt-get install -y -qq curl jq python3 python3-cryptography libsecret-tools dbus
 # shellcheck source=common.sh
 source /src/tests/common.sh
 CLI=/src/bin/isardvdi
-load='source <(sed -n "1,/^cmd=\"\\\${1:-help}\"/p" '$CLI' | head -n -1); set +e'
+load="source $CLI; set +e"
 
 echo "== FreeRDP 2 clipboard syntax"
 xvfb-run -a xfreerdp /help 2>/dev/null | grep -E '^\s+[+/-]?clipboard|clipboard ' | head -3

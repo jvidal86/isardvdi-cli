@@ -2,6 +2,7 @@
 # Regression tests for the security audit's findings (first pass), on fake data only.
 # shellcheck source=common.sh
 source "$(dirname "$0")/common.sh"
+wait_own() { TARGET_ID="$1" TARGET_OWN=1 TARGET_DEP=""; wait_target "$2" 1; }   # wait_target on your own desktop
 
 echo "== 1 exp claim as code (critical)"
 for e in "\"HOME[\$(touch $T/PWNED)]\"" "\"1+\$(touch $T/PWNED)\"" "[1]" "null"; do
@@ -88,8 +89,8 @@ echo "== 9 robustness"
 # Runs in a subshell, so count calls in a file: the first one fails, like a network blip.
 desktop_from_list() { echo x >> "$T/calls"; [[ $(wc -l < "$T/calls") -eq 1 ]] && return 75; echo '{"status":"Started","ip":"10.2.0.8"}'; }
 sleep() { :; }
-got=$(wait_started 0cf16815-bffb-449b-8949-6757e049299a 5 2>/dev/null)
-check "wait_started survives one failed poll" '[[ "$got" == 10.2.0.8 ]]'
+got=$(wait_own 0cf16815-bffb-449b-8949-6757e049299a 5 2>/dev/null)
+check "wait_target survives one failed poll" '[[ "$got" == 10.2.0.8 ]]'
 unset -f sleep desktop_from_list
 check "inherited _ISARDVDI_LOGIN_TOKEN is ignored" \
     '! (_ISARDVDI_LOGIN_TOKEN=1 cli list 2>/dev/null; [[ -e "$T/SSO_CALLED" ]])'
