@@ -1439,6 +1439,308 @@ bastion_key() {
     echo "The bastion lets this key into your desktops and your deployments' desktops."
 }
 
+# ---- Schedules: start deployments a few minutes before each class (systemd user timers) ------
+# Kept in $SCHED_FILE as [{name, slots: ["Tue 15:00"...], before: MIN, deployments: [{id, name}],
+# groups: [...], enabled}]. Each schedule gets a timer that runs 'isardvdi schedule run NAME'.
+# Running twice (this computer and a laptop, say) is harmless: only Stopped/Failed desktops are
+# started, and IsardVDI ignores a start of a desktop that is already starting or started.
+SCHED_FILE="$CONF_DIR/schedules.json"
+SCHED_LOG="$CONF_DIR/schedule.log"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SCHED_NAME_RE='^[a-z0-9][a-z0-9-]{0,31}$'
+DAYS=(Mon Tue Wed Thu Fri Sat Sun)
+
+sched_json() { if [[ -f "$SCHED_FILE" ]]; then cat "$SCHED_FILE"; else echo '[]'; fi; }
+sched_save() {
+    jq -e 'type == "array"' >/dev/null <<< "$1" || die "Internal error: bad schedule data."
+    jq . <<< "$1" | write_secret "$SCHED_FILE"
+}
+sched_get() { sched_json | jq -e --arg n "$1" '.[] | select(.name == $n)' 2>/dev/null; }
+sched_unit() { echo "isardvdi-schedule-$1"; }
+
+# Day name (English or Catalan, any case) → Mon..Sun; empty if unknown.
+day_norm() {
+    case "${1,,}" in
+        mon|monday|dl|dilluns)       echo Mon ;;
+        tue|tuesday|dt|dimarts)      echo Tue ;;
+        wed|wednesday|dc|dimecres)   echo Wed ;;
+        thu|thursday|dj|dijous)      echo Thu ;;
+        fri|friday|dv|divendres)     echo Fri ;;
+        sat|saturday|ds|dissabte)    echo Sat ;;
+        sun|sunday|dg|diumenge)      echo Sun ;;
+    esac
+}
+
+# "tue,thu 15:00" → one normalised slot per line ("Tue 15:00"); dies on anything else.
+parse_slot() {
+    local days time extra d n
+    read -r days time extra <<< "$1"
+    [[ -n "$days" && -n "$time" && -z "${extra:-}" ]] || die "Bad --at \"$1\": use DAY HH:MM, e.g. \"tue 15:00\" or \"mon,fri 18:30\"."
+    [[ "$time" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || die "Bad time \"$time\" in --at \"$1\": use HH:MM (24 h)."
+    time=$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}")
+    for d in ${days//,/ }; do
+        n=$(day_norm "$d")
+        [[ -n "$n" ]] || die "Unknown day \"$d\" in --at \"$1\" (mon..sun, or dl dt dc dj dv ds dg)."
+        echo "$n $time"
+    done
+}
+
+# "Tue 15:00" minus MIN minutes → "Tue 14:58" (crossing midnight moves to the day before).
+slot_minus() {
+    local day="${1%% *}" hm="${1##* }" i t
+    for i in "${!DAYS[@]}"; do [[ "${DAYS[$i]}" == "$day" ]] && break; done
+    t=$(( i * 1440 + 10#${hm%%:*} * 60 + 10#${hm##*:} - $2 ))
+    t=$(( (t % 10080 + 10080) % 10080 ))
+    printf '%s %02d:%02d' "${DAYS[$((t / 1440))]}" "$(( t % 1440 / 60 ))" "$(( t % 60 ))"
+}
+
+sched_cmd_path() {
+    # The timer runs this same program, by absolute path.
+    local p
+    p=$(readlink -f "$0" 2>/dev/null) || p="$0"
+    [[ "$p" == /* && "$p" != *[[:space:]%\\\"\']* ]] || die "Can't use \"$p\" in a systemd unit: install isardvdi in a path without spaces."
+    printf '%s' "$p"
+}
+
+sched_systemctl() { systemctl --user "$@"; }
+# Checked before a schedule is saved, so none is left without its timer.
+sched_need_systemd() {
+    command -v systemctl >/dev/null 2>&1 \
+        || die "Schedules need systemd (systemctl --user), which this system lacks. Nothing was changed."
+}
+
+# Writes (or removes) the systemd units of schedule $1 to match the file, and (re)starts its timer.
+sched_sync() {
+    local name="$1" s unit slot cal
+    unit=$(sched_unit "$name")
+    s=$(sched_get "$name") || s=""
+    if [[ -z "$s" ]]; then
+        sched_systemctl disable --now "$unit.timer" >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_USER_DIR/$unit.timer" "$SYSTEMD_USER_DIR/$unit.service"
+        sched_systemctl daemon-reload 2>/dev/null || true
+        return 0
+    fi
+    mkdir -p "$SYSTEMD_USER_DIR"
+    printf '[Unit]\nDescription=IsardVDI: start the desktops of schedule %s\n\n[Service]\nType=oneshot\nExecStart=%s schedule run %s\nTimeoutStartSec=15min\n' \
+        "$name" "$(sched_cmd_path)" "$name" > "$SYSTEMD_USER_DIR/$unit.service"
+    {
+        printf '[Unit]\nDescription=IsardVDI: start the desktops of schedule %s before class\n\n[Timer]\n' "$name"
+        while IFS= read -r slot; do
+            cal=$(slot_minus "$slot" "$(jq -r '.before' <<< "$s")")
+            printf 'OnCalendar=%s *-*-* %s:00\n' "${cal%% *}" "${cal##* }"
+        done < <(jq -r '.slots[]' <<< "$s")
+        # No Persistent=: a computer that was off at start time must not start the desktops of a
+        # class that is long over when it comes back.
+        printf 'AccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n'
+    } > "$SYSTEMD_USER_DIR/$unit.timer"
+    sched_systemctl daemon-reload
+    if [[ $(jq -r '.enabled' <<< "$s") == true ]]; then
+        sched_systemctl enable "$unit.timer" >/dev/null 2>&1
+        sched_systemctl restart "$unit.timer"
+    else
+        sched_systemctl disable --now "$unit.timer" >/dev/null 2>&1 || true
+    fi
+}
+
+cmd_schedule() {
+    local sub="${1:-list}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        list|ls)          sched_list "$@" ;;
+        add)              sched_add "$@" ;;
+        edit)             sched_edit "$@" ;;
+        remove|rm|delete) sched_remove "$@" ;;
+        enable|disable)   sched_enable "$sub" "$@" ;;
+        run)              sched_run "$@" ;;
+        *) die "Usage: isardvdi schedule list
+       isardvdi schedule add NAME --at \"DAY HH:MM\"... --deployment D... [--group G]... [--before MIN]
+       isardvdi schedule edit NAME [--at ...]... [--deployment ...]... [--group ...]... [--no-group]
+                                   [--before MIN] [--rename NEW]
+       isardvdi schedule remove|enable|disable|run NAME" ;;
+    esac
+}
+
+# Options shared by add and edit. Sets S_SLOTS, S_DEPS (JSON arrays or empty when not given),
+# S_GROUPS (JSON array, or empty), S_BEFORE, S_RENAME.
+sched_opts() {
+    S_SLOTS="" S_DEPS="" S_GROUPS="" S_BEFORE="" S_RENAME=""
+    local slots=() deps=() groups=() no_group=0 dep_json id
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --at)         [[ $# -ge 2 ]] || die "--at needs \"DAY HH:MM\""
+                          parse_slot "$2" >/dev/null   # dies here on a bad slot
+                          mapfile -t -O "${#slots[@]}" slots < <(parse_slot "$2"); shift 2 ;;
+            --deployment) [[ $# -ge 2 ]] || die "--deployment needs a deployment"; deps+=("$2"); shift 2 ;;
+            --group)      [[ $# -ge 2 ]] || die "--group needs a name"; groups+=("$2"); shift 2 ;;
+            --no-group)   no_group=1; shift ;;
+            --before)     [[ $# -ge 2 && "$2" =~ ^[0-9]{1,3}$ ]] && (( 10#$2 <= 120 )) \
+                              || die "--before needs minutes (0-120)"
+                          S_BEFORE=$((10#$2)); shift 2 ;;
+            --rename)     [[ $# -ge 2 ]] || die "--rename needs a name"; S_RENAME="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    (( ${#slots[@]} )) && S_SLOTS=$(printf '%s\n' "${slots[@]}" | jq -Rsc 'split("\n") | map(select(. != "")) | unique
+        | sort_by(. as $s | ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] | index($s[0:3]), $s)')
+    if (( ${#deps[@]} )); then
+        dep_json='[]'
+        local all q
+        all=$(list_deployments_json) || exit 1
+        for q in "${deps[@]}"; do
+            id=$(find_deployment "$q") || exit 1
+            dep_json=$(jq -c --arg id "$id" --argjson all "$all" \
+                '. + [{id: $id, name: ([$all[] | select(.id == $id) | .name][0] // $id)}] | unique_by(.id)' <<< "$dep_json")
+        done
+        S_DEPS="$dep_json"
+    fi
+    (( no_group )) && S_GROUPS='[]'
+    (( ${#groups[@]} )) && S_GROUPS=$(printf '%s\n' "${groups[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+    return 0
+}
+
+sched_add() {
+    sched_need_systemd
+    [[ $# -ge 1 && "$1" != -* ]] || die "Usage: isardvdi schedule add NAME --at \"DAY HH:MM\"... --deployment D... [--group G]... [--before MIN]"
+    local name="$1"; shift
+    [[ "$name" =~ $SCHED_NAME_RE ]] || die "Bad name \"$name\": lowercase letters, digits and -, up to 32 (e.g. aso, sgbd, bd)."
+    sched_get "$name" >/dev/null && die "There is already a schedule \"$name\". Change it with: isardvdi schedule edit $name"
+    sched_opts "$@"
+    [[ -z "$S_RENAME" ]] || die "--rename only applies to edit"
+    [[ -n "$S_SLOTS" ]] || die "Give at least one --at \"DAY HH:MM\" (the time the class starts)."
+    [[ -n "$S_DEPS" ]] || die "Give at least one --deployment."
+    local entry all
+    entry=$(jq -nc --arg n "$name" --argjson sl "$S_SLOTS" --argjson d "$S_DEPS" \
+        --argjson g "${S_GROUPS:-[]}" --argjson b "${S_BEFORE:-2}" \
+        '{name: $n, slots: $sl, before: $b, deployments: $d, groups: $g, enabled: true}')
+    all=$(sched_json | jq -c --argjson e "$entry" '. + [$e]')
+    sched_save "$all"
+    sched_sync "$name"
+    sched_list "$name"
+}
+
+sched_edit() {
+    sched_need_systemd
+    [[ $# -ge 1 && "$1" != -* ]] || die "Usage: isardvdi schedule edit NAME [--at ...]... [--deployment ...]... [--group ...]... [--no-group] [--before MIN] [--rename NEW]"
+    local name="$1"; shift
+    sched_get "$name" >/dev/null || die "No schedule \"$name\". See: isardvdi schedule list"
+    (( $# )) || die "Nothing to change. Options: --at, --deployment, --group, --no-group, --before, --rename"
+    sched_opts "$@"
+    local new="$name"
+    if [[ -n "$S_RENAME" ]]; then
+        new="$S_RENAME"
+        [[ "$new" =~ $SCHED_NAME_RE ]] || die "Bad name \"$new\": lowercase letters, digits and -, up to 32."
+        [[ "$new" == "$name" ]] || ! sched_get "$new" >/dev/null || die "There is already a schedule \"$new\"."
+    fi
+    local all
+    all=$(sched_json | jq -c --arg n "$name" --arg new "$new" --arg sl "$S_SLOTS" --arg d "$S_DEPS" \
+            --arg g "$S_GROUPS" --arg b "$S_BEFORE" '
+        map(if .name == $n then
+              .name = $new
+              | (if $sl != "" then .slots = ($sl | fromjson) else . end)
+              | (if $d != "" then .deployments = ($d | fromjson) else . end)
+              | (if $g != "" then .groups = ($g | fromjson) else . end)
+              | (if $b != "" then .before = ($b | tonumber) else . end)
+            else . end)')
+    sched_save "$all"
+    [[ "$new" == "$name" ]] || sched_sync "$name"   # the old name's units go
+    sched_sync "$new"
+    sched_list "$new"
+}
+
+sched_remove() {
+    [[ $# -eq 1 ]] || die "Usage: isardvdi schedule remove NAME"
+    sched_get "$1" >/dev/null || die "No schedule \"$1\". See: isardvdi schedule list"
+    sched_save "$(sched_json | jq -c --arg n "$1" 'map(select(.name != $n))')"
+    sched_sync "$1"
+    echo "Removed schedule \"$1\" (its desktops are not touched)."
+}
+
+sched_enable() {
+    sched_need_systemd
+    local action="$1"; shift
+    [[ $# -eq 1 ]] || die "Usage: isardvdi schedule $action NAME"
+    sched_get "$1" >/dev/null || die "No schedule \"$1\". See: isardvdi schedule list"
+    sched_save "$(sched_json | jq -c --arg n "$1" --argjson on "$([[ $action == enable ]] && echo true || echo false)" \
+        'map(if .name == $n then .enabled = $on else . end)')"
+    sched_sync "$1"
+    if [[ "$action" == enable ]]; then echo "Schedule \"$1\" is on."; else echo "Schedule \"$1\" is off (holidays?): isardvdi schedule enable $1"; fi
+}
+
+sched_list() {
+    local all names n s unit next last cur
+    all=$(sched_json)
+    if [[ $# -gt 0 ]]; then names="$1"; else names=$(jq -r '.[].name' <<< "$all"); fi
+    if [[ -z "$names" ]]; then
+        echo "No schedules. Add one, e.g.:"
+        echo "  isardvdi schedule add aso --at \"tue 15:00\" --at \"thu 16:00\" --deployment \"win server 25\""
+        return 0
+    fi
+    # Current names and sizes of the deployments, if the server answers (else the saved names).
+    cur=$(list_deployments_json 2>/dev/null) || cur='[]'
+    jq -e 'type == "array"' >/dev/null 2>&1 <<< "$cur" || cur='[]'
+    while IFS= read -r n; do
+        s=$(jq -c --arg n "$n" '.[] | select(.name == $n)' <<< "$all")
+        unit=$(sched_unit "$n")
+        next=$(sched_systemctl show -p NextElapseUSecRealtime --value "$unit.timer" 2>/dev/null) || next=""
+        last=$(grep -F " [$n] " "$SCHED_LOG" 2>/dev/null | tail -n 1 | sed "s/ \[$n\]//") || last=""
+        jq -r --argjson cur "$cur" --arg next "$next" --arg last "$last" "$JQ_CLEAN"'
+            "\(.name | clean)\(if .enabled then "" else "   (OFF)" end)",
+            "  class:   \(.slots | join(", "))  →  desktops start \(.before) min before",
+            (.deployments[] | .id as $id | ([$cur[] | select(.id == $id)][0]) as $d
+             | "  starts:  \(($d.name // .name) | clean)\(if $d then "  (\($d.total_desktops) desktops)" else "" end)"),
+            (if (.groups | length) > 0 then "  groups:  \(.groups | map(clean) | join(", ")) only" else empty end),
+            "  next:    \(if .enabled and $next != "" and $next != "n/a" then $next else "-" end)",
+            (if $last != "" then "  last:    \($last | clean)" else empty end),
+            ""' <<< "$s"
+    done <<< "$names"
+}
+
+sched_run() {
+    # What the timer runs (also by hand: starts the desktops now). Idempotent: see above.
+    [[ $# -eq 1 ]] || die "Usage: isardvdi schedule run NAME"
+    local name="$1" s ids=() groups=() args=() out rc=0 msg
+    s=$(sched_get "$name") || die "No schedule \"$name\"."
+    # Never fall back to a Microsoft sign-in from a timer: it would log the web browser out.
+    using_apikey || die "Schedules need an API key (isardvdi apikey create --from-browser)."
+    if [[ $(jq -r '.enabled' <<< "$s") != true ]]; then
+        sched_log "$name" "skipped: the schedule is off"
+        return 0
+    fi
+    mapfile -t ids < <(jq -r '.deployments[].id' <<< "$s")
+    mapfile -t groups < <(jq -r '.groups[]' <<< "$s")
+    args=("${ids[@]}")
+    local g
+    for g in ${groups[@]+"${groups[@]}"}; do args+=(--group "$g"); done
+    out=$( (deployment_bulk start "${args[@]}" -y) 2>&1 ) || rc=$?
+    printf '%s\n' "$out"
+    msg=$(printf '%s\n' "$out" | grep -E '^(Start requested|Nothing to do)' | head -n 1)
+    if [[ $rc -eq 0 ]]; then
+        [[ "$msg" == "Nothing to do"* ]] && msg="nothing to do: all already running"
+        sched_log "$name" "ok: ${msg:-done}"
+        sched_notify "$name" "${msg:-done}" normal
+    else
+        msg=$(printf '%s\n' "$out" | tail -n 1)
+        sched_log "$name" "FAILED: $msg"
+        sched_notify "$name" "FAILED: $msg" critical
+        exit "$rc"
+    fi
+}
+
+sched_log() {
+    # Keeps the last 200 runs.
+    local line tmp
+    line="$(date '+%a %F %R') [$1] $(sanitize "$2")"
+    tmp=$( { tail -n 199 "$SCHED_LOG" 2>/dev/null; printf '%s\n' "$line"; } )
+    printf '%s\n' "$tmp" | write_secret "$SCHED_LOG"
+}
+
+sched_notify() {
+    # A desktop notification, when there is a desktop to show it on.
+    command -v notify-send >/dev/null 2>&1 || return 0
+    [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+    timeout --foreground 5 notify-send -u "$3" -a isardvdi "IsardVDI: $1" "$2" 2>/dev/null || true
+}
+
 # Viewer files come from the server, and IsardVDI's defaults share local devices with the guest
 # (RDP: printers, smartcards, clipboard). The guest may be controlled by someone else (a student),
 # so these filters turn every device redirection off. stdin → stdout; $1=1 allows the clipboard.
@@ -2050,6 +2352,21 @@ COMMANDS
                                     then logs in with the desktop's stored password.
     bastion key [PUBLIC-KEY-FILE]   Show, or set, the SSH public key in your portal
                                     profile: the one the bastion lets in.
+    schedule [list]                 Your class schedules: when, what they start, next and
+                                    last run.
+    schedule add NAME --at "DAY HH:MM"... --deployment D... [--group G]... [--before MIN]
+                                    Start the deployments' desktops MIN minutes (default 2)
+                                    before each class, by a systemd user timer on this
+                                    computer (it must be on, with you logged in). DAY: mon..
+                                    sun or dl dt dc dj dv ds dg, several as "tue,thu 15:00".
+                                    Only Stopped desktops are started: running it from two
+                                    computers is harmless. Results: notification + list.
+    schedule edit NAME [--at ...]... [--deployment ...]... [--group ...]... [--no-group]
+                  [--before MIN] [--rename NEW]
+                                    Change a schedule; a repeated option replaces them all.
+    schedule enable|disable NAME    Switch a schedule on or off (holidays) without losing it.
+    schedule remove NAME            Delete a schedule and its timer.
+    schedule run NAME               Start its desktops now (what the timer runs).
     console <desktop> | <deployment> <student> [--browser|--rdp] [--clipboard] [--no-start]
                                     Open a desktop's console, auto-starting it if needed.
                                     Works for your students' desktops too. Default:
@@ -2198,6 +2515,7 @@ case "$cmd" in
     deployments|deps) cmd_deployments "$@" ;;
     deployment|dep)  cmd_deployment "$@" ;;
     bastion)         cmd_bastion "$@" ;;
+    schedule|schedules|sched) cmd_schedule "$@" ;;
     students)        cmd_students "$@" ;;
     console)         cmd_console "$@" ;;
     apikey|api-key)  cmd_apikey "$@" ;;

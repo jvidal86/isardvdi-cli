@@ -102,6 +102,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `students <deployment>` | A deployment's desktops: student, group, state, IP, id |
 | `deployment start\|stop\|extend <deployment>... [--group G]... [-y] [--wait] [--force]` | A whole class at once: every desktop of the deployments (or of a group), after asking |
 | `bastion status\|on\|off <deployment>` / `--desktop <desktop>`, `bastion key [file.pub]` | SSH through IsardVDI's bastion: switch it on per deployment, set your profile key |
+| `schedule list\|add\|edit\|enable\|disable\|remove\|run` | Start deployments a few minutes before each class (systemd timer) |
 | `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
 | `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
 | `forget` | Delete every secret stored on this computer (before leaving a shared one) |
@@ -149,6 +150,27 @@ isardvdi ssh my-desktop
 If ping works but `ssh` hangs at the key exchange, large packets are being dropped on the way:
 lower the tunnel MTU with `ISARDVDI_VPN_MTU=1280 isardvdi vpn-config` and restart the tunnel.
 On WSL this is the default.
+
+### Starting the class before it begins
+
+```sh
+isardvdi schedule add aso  --at "tue 15:00" --at "thu 16:00" \
+    --deployment "win server 25 Unique SID" --deployment "Windows 11 uniquie SID ASIX2"
+isardvdi schedule add sgbd --at "tue 18:30" --deployment "Ubuntu 24 server ASIX.1"
+isardvdi schedule add bd   --at "mon 15:00" --at "fri 18:30" --deployment "Ubuntu 24 server ASIX.1"
+isardvdi schedule            # what starts when, the next run and how the last one went
+```
+
+`--at` is the time the class starts; the desktops are started `--before` minutes earlier (2 by
+default). Days are `mon`..`sun` or `dl dt dc dj dv ds dg`, and `"tue,thu 15:00"` sets two at once.
+`--group` keeps only the students of a group. `schedule disable aso` pauses one for the holidays
+(`enable` brings it back), `schedule edit` changes it (a repeated option replaces the old values),
+and `schedule run aso` starts its desktops right now.
+
+Each schedule is a **systemd user timer on this computer**, so the computer must be on, with you
+logged in (the API key comes from your keyring), at that time; a missed start is not made up later.
+A notification shows how each run went. Only Stopped desktops are started and IsardVDI ignores a
+start of a running one, so the same schedule on a second computer (your laptop) is harmless.
 
 ### Students' desktops: the bastion
 
