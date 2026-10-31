@@ -643,6 +643,29 @@ cmd_stop() {
     fi
 }
 
+cmd_extend() {
+    [[ $# -ge 1 ]] || die "Usage: isardvdi extend <name|id>"
+    local id errmsg code shutdown
+    id=$(find_desktop "$1")
+    if errmsg=$(api_call PUT "/api/v4/item/desktop/$id/extend-timeout" 2>&1 >/dev/null); then
+        shutdown=$(desktop_from_list "$id" | jq -r '.scheduled.shutdown // empty' 2>/dev/null)
+        if [[ -n "$shutdown" ]] && shutdown=$(date -d "$shutdown" '+%Y-%m-%d %H:%M' 2>/dev/null); then
+            echo "Auto-shutdown extended: $shutdown"
+        else
+            echo "Auto-shutdown extended for $id"
+        fi
+        return
+    fi
+    code=$(grep -oE '"description_code": ?"[a-z_]+"' <<<"$errmsg" | grep -oE '[a-z_]+"$' | tr -d '"')
+    case "$code" in
+        desktop_not_started)            die "Can't extend: the desktop is not started." ;;
+        desktop_no_scheduled_shutdown)  die "Can't extend: this desktop has no auto-shutdown timer." ;;
+        desktop_extend_not_allowed)     die "Can't extend: extending is disabled by the administrator's policy." ;;
+        desktop_max_extensions_reached) die "Can't extend: the maximum number of extensions has been used." ;;
+        *)                              die "Couldn't extend the auto-shutdown timer. $errmsg" ;;
+    esac
+}
+
 cmd_viewer() {
     # Writes the desktop's SPICE connection file (.vv) and prints its path. The file holds a
     # one-time console password, so it is created mode 600 and its content is never printed.
@@ -1503,6 +1526,8 @@ COMMANDS
                                     Rename a desktop (4-50 letters, digits, spaces, . _ -).
                                     IsardVDI only edits a stopped desktop: --restart stops a
                                     running one, renames it and starts it again.
+    extend <name|id>                Postpone a started desktop's automatic shutdown and
+                                    print the new time (as the portal's "extend" button).
     viewer <name|id> [FILE.vv]      Save the SPICE connection file of a started desktop
                                     (mode 600, one-time password inside) and print its
                                     path. Open it with remote-viewer (virt-viewer).
@@ -1653,6 +1678,7 @@ case "$cmd" in
     start)           cmd_start "$@" ;;
     stop)            cmd_stop "$@" ;;
     rename)          cmd_rename "$@" ;;
+    extend)          cmd_extend "$@" ;;
     ssh)             cmd_ssh "$@" ;;
     viewer|spice)    cmd_viewer "$@" ;;
     get)             [[ $# -ge 1 ]] || die "Usage: isardvdi get </api/path>"

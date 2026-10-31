@@ -94,6 +94,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `start <name\|id>` | Start and wait for state `Started` with an IP |
 | `stop [--force] <name\|id>` | Stop a desktop |
 | `rename <name\|id> <new-name> [--restart]` | Rename a desktop; `--restart` stops a running one first and starts it again |
+| `extend <name\|id>` | Postpone a started desktop's automatic shutdown |
 | `ssh <name\|id> [-l user] [--no-start] [-- ssh-args]` | Auto-start if needed, then SSH in |
 | `vpn-config` | Download the WireGuard config, print the `wg-quick` command |
 | `vpn-reload` | Rotate keys and bounce the tunnel (**breaks a working tunnel if misused**) |
