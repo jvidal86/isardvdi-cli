@@ -46,12 +46,14 @@ main() {
     download "$BASE/bin/isardvdi"     "$tmp/isardvdi"      || err "download failed: $BASE/bin/isardvdi"
     download "$BASE/lib/sso_login.py" "$tmp/sso_login.py"  || err "download failed: $BASE/lib/sso_login.py"
     download "$BASE/lib/browser_token.py" "$tmp/browser_token.py" || err "download failed: $BASE/lib/browser_token.py"
+    download "$BASE/lib/secret_clipboard.py" "$tmp/secret_clipboard.py" || err "download failed: $BASE/lib/secret_clipboard.py"
     head -1 "$tmp/isardvdi" | grep -q '^#!' || err "downloaded file does not look like a script"
 
     mkdir -p "$BIN_DIR" "$DATA_DIR"
     install -m 0755 "$tmp/isardvdi"     "$BIN_DIR/isardvdi"
     install -m 0644 "$tmp/sso_login.py" "$DATA_DIR/sso_login.py"
     install -m 0644 "$tmp/browser_token.py" "$DATA_DIR/browser_token.py"
+    install -m 0644 "$tmp/secret_clipboard.py" "$DATA_DIR/secret_clipboard.py"
     info "installed $BIN_DIR/isardvdi and its helpers in $DATA_DIR"
 
     # Dependencies. Playwright (Python) drives the Microsoft SSO sign-in.

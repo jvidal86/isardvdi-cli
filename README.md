@@ -103,6 +103,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `deployment start\|stop\|extend <deployment>... [--group G]... [-y] [--wait] [--force]` | A whole class at once: every desktop of the deployments (or of a group), after asking |
 | `bastion status\|on\|off <deployment>` / `--desktop <desktop>`, `bastion key [file.pub]` | SSH through IsardVDI's bastion: switch it on per deployment, set your profile key |
 | `schedule list\|add\|edit\|enable\|disable\|remove\|run` | Start deployments a few minutes before each class (systemd timer) |
+| `web pull [--from HOST]`, `web push [--to HOST]`, `web extension` | One web session on both of your computers (see below) |
 | `web keepalive` | Renew your browser's portal session, so the portal doesn't ask you to sign in again (up to its maximum session time); the tray runs it every 10 min |
 | `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
 | `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
@@ -174,6 +175,29 @@ A notification shows how each run went; a start that comes more than 15 minutes 
 was asleep) is skipped, and a failed one is retried for about two minutes. Only Stopped or Failed
 desktops are started and IsardVDI ignores a
 start of a running one, so the same schedule on a second computer (your laptop) is harmless.
+
+### One web session on both computers
+
+IsardVDI keeps one session per user, so signing in to the portal on the laptop logs the PC out, and
+the other way round. Both browsers can share the same session instead: the portal doesn't tie a
+session to a network address. The laptop reaches the PC over SSH (a Host of `~/.ssh/config`, e.g. the
+Cloudflare tunnel), so it does the talking.
+
+```sh
+isardvdi web extension                   # once per computer: then Load unpacked in vivaldi://extensions
+isardvdi web pull --from isardpc         # on the laptop: the PC browser's session (isardpc is remembered)
+isardvdi web push                        # on the laptop, after signing in there: send it to the PC...
+isardvdi web pull                        # ...and on the PC, take it
+```
+
+`web pull` renews the session, checks it's your account (the API key's), and puts it on the
+clipboard for 60 seconds, marked so that clipboard histories (KDE's Klipper, Windows' Win+V) don't
+keep it. Then click the **IsardVDI session** extension's button, **Use the shared session**: it
+installs the session in the browser and empties the clipboard. A bookmarklet can't do this: the
+portal's script policy and Vivaldi both block it. The extension only has access to the portal's
+address, and to the clipboard when you click it. The session never goes anywhere but your two
+computers, over SSH. It still ends at the portal's maximum session time; the keep-alive (above, or
+the tray) keeps it alive until then.
 
 ### Students' desktops: the bastion
 

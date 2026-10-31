@@ -9,12 +9,14 @@ CONF_FILE="$CONF_DIR/config"
 PROFILE_DIR="$CONF_DIR/browser-profile"
 HELPER="${ISARDVDI_SSO_HELPER:-${XDG_DATA_HOME:-$HOME/.local/share}/isardvdi-cli/sso_login.py}"
 BROWSER_HELPER="$(dirname "$HELPER")/browser_token.py"
+CLIPBOARD_HELPER="$(dirname "$HELPER")/secret_clipboard.py"
 TOKEN_FILE="$CONF_DIR/token"
 APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
 RENEW_STAMP="$CONF_DIR/renew-attempt"
 VPN_ROUTES_FILE="$CONF_DIR/vpn-routes"   # the server's VPN routes, as accepted
 BASTION_HOST_FILE="$CONF_DIR/bastion-host"   # the bastion host:port, as accepted
+WEB_SESSION_FILE="$CONF_DIR/web-session"     # a web session pushed from your other computer
 KEY_DAYS=90      # default API key lifetime (server maximum: 365)
 RENEW_DAYS=30    # renew automatically when the key has less than this left
 WARN_DAYS=14     # ... and warn when renewing keeps failing
@@ -80,7 +82,7 @@ private_path() {
 
 secure_conf() {
     local f
-    for f in "$CONF_DIR" "$CONF_FILE" "$TOKEN_FILE" "$APIKEY_FILE" "$VPN_FILE" "$PROFILE_DIR"; do
+    for f in "$CONF_DIR" "$CONF_FILE" "$TOKEN_FILE" "$APIKEY_FILE" "$VPN_FILE" "$PROFILE_DIR" "$WEB_SESSION_FILE"; do
         private_path "$f"
     done
 }
@@ -1451,29 +1453,40 @@ bastion_key() {
 # The new token it gets back is thrown away; the browser renews its own when it needs to.
 
 cmd_web() {
-    case "${1:-}" in
-        keepalive) shift; web_keepalive "$@" ;;
-        *) die "Usage: isardvdi web keepalive" ;;
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        keepalive)  web_keepalive "$@" ;;
+        pull)       web_pull "$@" ;;
+        push)       web_push "$@" ;;
+        extension)  web_extension "$@" ;;
+        token)      web_token "$@" ;;     # internal: what 'web pull' runs over SSH
+        receive)    web_receive "$@" ;;   # internal: what 'web push' runs over SSH
+        *) die "Usage: isardvdi web keepalive
+       isardvdi web pull [--from [USER@]HOST] [--print]
+       isardvdi web push [--to [USER@]HOST]
+       isardvdi web extension [DIR]" ;;
     esac
 }
 
-web_keepalive() {
-    # Exit status: 0 renewed; 3 no portal session in this computer's browsers; 4 the session has
-    # ended (sign in again in the browser); 75 no answer or a server error (try again later).
-    [[ $# -eq 0 ]] || die "Usage: isardvdi web keepalive"
-    load_config
-    local tkn rc=0 resp status body exp left old_exp
-    # The API key's account, if there is one: never renew someone else's session.
-    tkn=$(browser_portal_token "$(apikey_user_id)" 60 --allow-expired 2>/dev/null) || rc=$?
-    if [[ $rc -ne 0 ]]; then
+# The browser's own session token (yours: the API key's account), expired or not. Exit 3 if none.
+web_browser_token() {
+    local tkn
+    tkn=$(browser_portal_token "$(apikey_user_id)" 60 --allow-expired 2>/dev/null) || {
         err "No portal session in this computer's browsers: sign in to $URL in your browser."
         exit 3
-    fi
+    }
+    printf '%s' "$tkn"
+}
+
+web_renew() {
+    # web_renew TOKEN. Renews TOKEN's session on the server; stdout: the new token (same session,
+    # valid for the portal's token time). Exit 4 if the session has ended, 75 no answer, 1 else.
+    local tkn="$1" resp status body new old_exp
     old_exp=$(jwt_exp "$tkn")
     resp=$(curl -sS -X POST -w '\n%{http_code}' --proto =https --connect-timeout 15 --max-time 60 \
         -H @<(printf 'Authorization: Bearer %s\n' "$tkn") -H 'Content-Type: application/json' \
         --data-binary '{}' "$URL/authentication/renew") || resp=$'\n000'
-    unset tkn
     status="${resp##*$'\n'}"
     body="${resp%$'\n'*}"
     case "$status" in
@@ -1490,13 +1503,270 @@ again to $URL in your browser."
         000|5*) err "No answer from $URL (HTTP $status). Try again later."; exit 75 ;;
         *) err "HTTP $status on POST /authentication/renew: $(sanitize "${body:0:200}")"; exit 1 ;;
     esac
-    exp=$(jwt_exp "$(jq -r '.token // empty' <<< "$body" 2>/dev/null)")
+    new=$(jq -r '.token // empty' <<< "$body" 2>/dev/null) || new=""
+    printf '%s' "$new"
+}
+
+web_keepalive() {
+    # Exit status: 0 renewed; 3 no portal session in this computer's browsers; 4 the session has
+    # ended (sign in again in the browser); 75 no answer or a server error (try again later).
+    [[ $# -eq 0 ]] || die "Usage: isardvdi web keepalive"
+    load_config
+    local tkn new exp left
+    tkn=$(web_browser_token) || exit $?
+    new=$(web_renew "$tkn") || exit $?
+    unset tkn
+    exp=$(jwt_exp "$new")
     if [[ "$exp" =~ ^[0-9]+$ ]]; then
         left=$(( (exp - $(date +%s)) / 60 ))
         echo "Web session renewed: valid until $(fmt_epoch "$exp") ($left min)."
     else
         echo "Web session renewed."
     fi
+}
+
+# ---- Sharing one web session between your computers ------------------------------------------
+# IsardVDI keeps one session per user: signing in on a second computer logs the first one out.
+# The portal doesn't tie a session to an address (checked on the school's portal: a session made
+# at home renews from IsardVDI's own network), so both browsers can use the same session. The
+# laptop reaches this PC by SSH, so it does the talking: 'web pull' fetches the PC browser's
+# session, 'web push' sends the laptop's. A small browser extension then installs it in the
+# browser ('isardvdi web extension'): a bookmarklet can't, the portal's script policy and Vivaldi
+# block it. Nothing is stored anywhere else.
+
+# A session about to be installed in a browser: a portal login token (not an API key) of the API
+# key's account, not expired. Dies saying why not.
+check_shared_token() {
+    local payload uid
+    payload=$(jwt_payload "$1")
+    [[ -n "$payload" ]] || die "That is not an IsardVDI session (not a token)."
+    jq -e '(.type // "login") == "login" and .session_id != "api-key"' >/dev/null <<< "$payload" \
+        || die "That is not a portal session (an API key, or another kind of token)."
+    jq -e --argjson now "$(date +%s)" '(.exp // 0) > $now' >/dev/null <<< "$payload" \
+        || die "That session token has expired."
+    uid=$(apikey_user_id)
+    if [[ -n "$uid" && $(jq -r '.data.user_id // ""' <<< "$payload") != "$uid" ]]; then
+        die "That session belongs to another IsardVDI account than this computer's API key: not used."
+    fi
+}
+
+# The other computer, [USER@]HOST or a Host of ~/.ssh/config: from --from/--to, else the one
+# remembered. A new one is remembered (the config file is shell code: validated, and quoted).
+web_peer() {
+    local peer="$1" tmp
+    if [[ -z "$peer" ]]; then
+        printf '%s' "${WEB_PEER:-}"
+        return 0
+    fi
+    [[ "$peer" =~ ^([A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+        || die "Not an SSH destination: $(sanitize "$peer") (use USER@HOST or a Host from ~/.ssh/config)."
+    if [[ "${WEB_PEER:-}" != "$peer" ]]; then
+        tmp=$( { grep -v '^WEB_PEER=' "$CONF_FILE" || true; printf 'WEB_PEER=%q\n' "$peer"; } )
+        printf '%s\n' "$tmp" | write_secret "$CONF_FILE"
+        err "Remembered the other computer: $peer"
+    fi
+    printf '%s' "$peer"
+}
+
+# Runs the CLI on the other computer: `isardvdi web SUBCOMMAND`, with its desktop session's keyring
+# (where the API key and the browser's cookie key are). Stdin and stdout are the SSH pipe.
+web_ssh() {
+    local peer="$1" sub="$2"
+    # A fixed command: nothing from this computer goes into the remote shell's code.
+    # shellcheck disable=SC2016  # expanded by the remote shell
+    local remote='p="$HOME/.local/bin/isardvdi"; [ -x "$p" ] || p=isardvdi; DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" exec "$p" web '"$sub"
+    ssh -T -o ForwardAgent=no -o ForwardX11=no -- "$peer" "$remote"
+}
+
+web_token() {
+    # Internal: renews this computer's browser session and prints the new token, for 'web pull'
+    # on the other computer. Only into a pipe: a session must never land on a screen.
+    [[ $# -eq 0 ]] || die "Usage: isardvdi web token (it's run by 'isardvdi web pull' on the other computer)"
+    [[ ! -t 1 ]] || die "'web token' prints a live session: it only writes into a pipe (it's what 'isardvdi web pull' runs here over SSH)."
+    load_config
+    local tkn new
+    tkn=$(web_browser_token) || exit $?
+    new=$(web_renew "$tkn") || exit $?
+    check_shared_token "$new"
+    printf '%s\n' "$new"
+}
+
+web_receive() {
+    # Internal: stores a session sent by 'web push' from the other computer, for 'web pull' here.
+    [[ $# -eq 0 ]] || die "Usage: isardvdi web receive (it's run by 'isardvdi web push' on the other computer)"
+    [[ ! -t 0 ]] || die "'web receive' reads a session from a pipe (it's what 'isardvdi web push' runs here over SSH)."
+    load_config
+    local tkn
+    read -r tkn || true
+    tkn="${tkn//[[:space:]]/}"
+    check_shared_token "$tkn"
+    printf '%s\n' "$tkn" | write_secret "$WEB_SESSION_FILE"
+    echo "Received the session (until $(fmt_epoch "$(jwt_exp "$tkn")"), renewable). Here: isardvdi web pull"
+}
+
+# Puts a session on this computer's clipboard so that clipboard histories don't keep it, and clears
+# it after a minute. Linux desktop: lib/secret_clipboard.py (Qt). WSL: the Windows clipboard,
+# excluded from its history and cloud sync. Fails if neither is possible.
+web_clipboard() {
+    local tkn="$1"
+    if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/dev/null 2>&1; then
+        # The token on stdin, never on a command line. -STA: the clipboard needs it.
+        # shellcheck disable=SC2016  # PowerShell code
+        local ps='$t=[Console]::In.ReadLine(); Add-Type -AssemblyName System.Windows.Forms;
+$d=New-Object System.Windows.Forms.DataObject; $d.SetText($t);
+$z=New-Object System.IO.MemoryStream(,[byte[]](0,0,0,0));
+$d.SetData("ExcludeClipboardContentFromMonitorProcessing",$z); $d.SetData("CanIncludeInClipboardHistory",$z); $d.SetData("CanUploadToCloudClipboard",$z);
+[System.Windows.Forms.Clipboard]::SetDataObject($d,$true); Start-Sleep -Seconds 60;
+if ([System.Windows.Forms.Clipboard]::GetText() -eq $t) { [System.Windows.Forms.Clipboard]::Clear() }'
+        printf '%s\n' "$tkn" | nohup powershell.exe -NoProfile -NonInteractive -STA -Command "$ps" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        return 0
+    fi
+    [[ -e "$CLIPBOARD_HELPER" ]] || return 1
+    check_helper "$CLIPBOARD_HELPER"
+    printf '%s\n' "$tkn" | python3 -I "$CLIPBOARD_HELPER" --seconds 60
+}
+
+web_pull() {
+    # The session to use in this computer's browser: the other computer's (over SSH, from
+    # --from or the one remembered), else one it pushed here. Always renewed first, so it's fresh.
+    local from="" print=0 peer tkn rc=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) [[ $# -ge 2 ]] || die "--from needs [USER@]HOST"; from="$2"; shift 2 ;;
+            --print) print=1; shift ;;
+            *) die "Usage: isardvdi web pull [--from [USER@]HOST] [--print]" ;;
+        esac
+    done
+    load_config
+    peer=$(web_peer "$from")
+    if [[ -n "$peer" ]]; then
+        tkn=$(web_ssh "$peer" token </dev/null) || rc=$?   # nothing to send: don't hold the terminal
+        [[ $rc -eq 0 ]] || die "Couldn't get the session from $peer (exit $rc; see above)."
+    elif [[ -f "$WEB_SESSION_FILE" ]]; then
+        tkn=$(web_renew "$(cat "$WEB_SESSION_FILE")") || { rc=$?; rm -f "$WEB_SESSION_FILE"; exit "$rc"; }
+        printf '%s\n' "$tkn" | write_secret "$WEB_SESSION_FILE"
+    else
+        die "No other computer to pull from. Once: isardvdi web pull --from [USER@]HOST
+(the computer whose browser is signed in; a Host from ~/.ssh/config works too)."
+    fi
+    tkn="${tkn//[[:space:]]/}"
+    check_shared_token "$tkn"
+    if [[ $print -eq 1 ]]; then
+        [[ ! -t 1 ]] || die "--print writes a live session: only into a pipe, never to the screen."
+        printf '%s\n' "$tkn"
+        return 0
+    fi
+    web_clipboard "$tkn" || die "No clipboard to put it on here (a desktop session is needed)."
+    echo "Session copied: it stays on the clipboard for 60 s and out of clipboard history."
+    echo "Now, in your browser, click the 'IsardVDI session' extension's button: Use the shared session"
+    echo "(once: isardvdi web extension)."
+}
+
+web_push() {
+    # Sends this computer's session to the other one ('web pull' there installs it). From this
+    # computer's browser if it can be read, else pasted (the extension's "Copy this browser's
+    # session" button copies it).
+    local to="" peer tkn rc=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --to) [[ $# -ge 2 ]] || die "--to needs [USER@]HOST"; to="$2"; shift 2 ;;
+            *) die "Usage: isardvdi web push [--to [USER@]HOST]" ;;
+        esac
+    done
+    load_config
+    peer=$(web_peer "$to")
+    [[ -n "$peer" ]] || die "Where to? Once: isardvdi web push --to [USER@]HOST"
+    tkn=$(browser_portal_token "$(apikey_user_id)" 60 --allow-expired 2>/dev/null) || tkn=$(read_portal_token)
+    tkn=$(web_renew "$tkn") || exit $?
+    check_shared_token "$tkn"
+    printf '%s\n' "$tkn" | web_ssh "$peer" receive || rc=$?
+    [[ $rc -eq 0 ]] || die "Couldn't send the session to $peer (exit $rc; see above)."
+    echo "Sent. On that computer: isardvdi web pull, then the extension's button."
+}
+
+web_extension() {
+    # Writes the 'IsardVDI session' browser extension (Chromium: Vivaldi, Chrome, Edge) for this
+    # portal into DIR. Its button installs a pulled session through the browser's cookie API (a
+    # page's script policy can't block that, unlike a bookmarklet), then empties the clipboard; a
+    # second button copies this browser's session for 'web push'.
+    [[ $# -le 1 ]] || die "Usage: isardvdi web extension [DIR]"
+    load_config
+    local dir="${1:-}" host winhome
+    host="${URL#https://}"
+    host="${host%%/*}"
+    if [[ -z "$dir" ]]; then
+        dir="${XDG_DATA_HOME:-$HOME/.local/share}/isardvdi-cli/browser-extension"
+        # WSL: the browser runs on Windows and must see the folder.
+        if grep -qi microsoft /proc/version 2>/dev/null && command -v cmd.exe >/dev/null 2>&1 \
+            && winhome=$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r') && [[ -n "$winhome" ]]; then
+            dir="$(wslpath "$winhome")/isardvdi-session-extension"
+        fi
+    fi
+    [[ ! -L "$dir" ]] || die "Refusing to write into $dir: it is a symlink."
+    mkdir -p "$dir"
+    jq -n --arg host "$host" '{
+        manifest_version: 3,
+        name: "IsardVDI session",
+        version: "1.0",
+        description: "Use the IsardVDI web session of your other computer (isardvdi web pull), or copy this one (isardvdi web push).",
+        permissions: ["cookies", "clipboardRead", "clipboardWrite", "tabs"],
+        host_permissions: ["https://\($host)/*"],
+        action: {default_popup: "popup.html", default_title: "IsardVDI session"}
+    }' > "$dir/manifest.json"
+    cat > "$dir/popup.html" <<'EOF'
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 12px; width: 260px; }
+  button { display: block; width: 100%; margin: 6px 0; padding: 7px; font: inherit; cursor: pointer; }
+  #status { margin-top: 8px; color: #555; min-height: 2.6em; }
+</style>
+<b>IsardVDI session</b>
+<button id="use">Use the shared session</button>
+<button id="copy">Copy this browser's session</button>
+<div id="status"></div>
+<script src="popup.js"></script>
+EOF
+    {
+        printf "const PORTAL = 'https://%s';\n" "$host"
+        cat <<'EOF'
+const status = (t) => { document.getElementById('status').textContent = t; };
+const claims = (t) => {
+  try { return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch { return null; }
+};
+// A portal session: a login token, not an API key, not expired.
+const valid = (t) => {
+  const c = /^[\w-]+\.[\w-]+\.[\w-]+$/.test(t) && claims(t);
+  return c && (c.type || 'login') === 'login' && c.session_id !== 'api-key' && c.exp * 1000 > Date.now() ? c : null;
+};
+const hhmm = (s) => new Date(s * 1000).toTimeString().slice(0, 5);
+
+document.getElementById('use').onclick = async () => {
+  let t = '';
+  try { t = (await navigator.clipboard.readText()).trim(); } catch (e) { status('Can\'t read the clipboard: ' + e.message); return; }
+  const c = valid(t);
+  if (!c) { status('No IsardVDI session on the clipboard. Run: isardvdi web pull'); return; }
+  await chrome.cookies.set({ url: PORTAL + '/', name: 'isardvdi_session', value: t, path: '/', secure: true, sameSite: 'strict' });
+  try { await navigator.clipboard.writeText(''); } catch {}  // don't leave it on the clipboard
+  const [tab] = await chrome.tabs.query({ url: PORTAL + '/*' });
+  if (tab) await chrome.tabs.update(tab.id, { url: PORTAL + '/desktops', active: true });
+  else await chrome.tabs.create({ url: PORTAL + '/desktops' });
+  status('Signed in as ' + ((c.data && c.data.name) || 'you') + ', session until ' + hhmm(c.exp) + ' (renewable).');
+};
+
+document.getElementById('copy').onclick = async () => {
+  const c = await chrome.cookies.get({ url: PORTAL + '/', name: 'isardvdi_session' })
+         || await chrome.cookies.get({ url: PORTAL + '/', name: 'authorization' });
+  if (!c || !claims(c.value)) { status('No IsardVDI session in this browser: sign in to the portal first.'); return; }
+  await navigator.clipboard.writeText(c.value);
+  status('Copied. Now run: isardvdi web push (and paste it if asked). Copy something else afterwards.');
+};
+EOF
+    } > "$dir/popup.js"
+    echo "Wrote the 'IsardVDI session' extension to: $dir"
+    echo "Load it once: open vivaldi://extensions (or chrome:// / edge://), switch on Developer mode,"
+    echo "click 'Load unpacked' and pick that folder. Then pin its button to the toolbar."
 }
 
 # ---- Schedules: start deployments a few minutes before each class (systemd user timers) ------
@@ -2382,7 +2652,7 @@ cmd_forget() {
     fi
     ! secret_exists apikey "$APIKEY_FILE" || cmd_apikey revoke
     secret_clear token "$TOKEN_FILE"
-    rm -f "$VPN_FILE" "$RENEW_STAMP"
+    rm -f "$VPN_FILE" "$RENEW_STAMP" "$WEB_SESSION_FILE"
     rm -rf "$PROFILE_DIR"
     echo "Removed the cached token, the VPN config and the saved Microsoft sign-in."
     echo "Kept $CONF_FILE (URL and account name only)."
@@ -2462,6 +2732,22 @@ COMMANDS
                                     then logs in with the desktop's stored password.
     bastion key [PUBLIC-KEY-FILE]   Show, or set, the SSH public key in your portal
                                     profile: the one the bastion lets in.
+    web pull [--from [USER@]HOST] [--print]
+                                    Use one web session on both of your computers, so
+                                    signing in on one doesn't log the other out. Gets the
+                                    session of the other computer's browser over SSH (HOST
+                                    is remembered; a Host of ~/.ssh/config works), or the
+                                    one 'web push' sent here; renews it, checks it's your
+                                    account, and puts it on the clipboard for 60 s, out of
+                                    clipboard history. Then the 'IsardVDI session' browser
+                                    extension installs it (one click) and empties the
+                                    clipboard.
+    web push [--to [USER@]HOST]     Send this computer's web session to the other one
+                                    (from this browser, or pasted: the extension's "Copy"
+                                    button copies it); 'web pull' there installs it.
+    web extension [DIR]             Write the 'IsardVDI session' browser extension (Vivaldi,
+                                    Chrome, Edge) for this portal, to load once with
+                                    'Load unpacked'. On WSL: into your Windows home.
     web keepalive                   Renew the portal session of this computer's web
                                     browser, so the portal doesn't ask you to sign in
                                     again after a while (up to the portal's maximum
