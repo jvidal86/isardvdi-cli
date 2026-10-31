@@ -1570,13 +1570,14 @@ web_peer() {
     printf '%s' "$peer"
 }
 
-# Runs the CLI on the other computer: `isardvdi web SUBCOMMAND`, with its desktop session's keyring
-# (where the API key and the browser's cookie key are). Stdin and stdout are the SSH pipe.
-web_ssh() {
-    local peer="$1" sub="$2"
-    # A fixed command: nothing from this computer goes into the remote shell's code.
+# Runs the CLI on the other computer: `isardvdi WORDS` (fixed words from this file only: "web
+# token", "web receive", "apikey print"), with its desktop session's keyring (where the API key and
+# the browser's cookie key are). Stdin and stdout are the SSH pipe.
+peer_ssh() {
+    local peer="$1" words="$2"
+    [[ "$words" =~ ^(web\ token|web\ receive|apikey\ print)$ ]] || die "Internal error: peer_ssh $words"
     # shellcheck disable=SC2016  # expanded by the remote shell
-    local remote='p="$HOME/.local/bin/isardvdi"; [ -x "$p" ] || p=isardvdi; DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" exec "$p" web '"$sub"
+    local remote='p="$HOME/.local/bin/isardvdi"; [ -x "$p" ] || p=isardvdi; DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" exec "$p" '"$words"
     ssh -T -o ForwardAgent=no -o ForwardX11=no -- "$peer" "$remote"
 }
 
@@ -1643,7 +1644,7 @@ web_pull() {
     load_config
     peer=$(web_peer "$from")
     if [[ -n "$peer" ]]; then
-        tkn=$(web_ssh "$peer" token </dev/null) || rc=$?   # nothing to send: don't hold the terminal
+        tkn=$(peer_ssh "$peer" "web token" </dev/null) || rc=$?   # nothing to send: don't hold the terminal
         [[ $rc -eq 0 ]] || die "Couldn't get the session from $peer (exit $rc; see above)."
     elif [[ -f "$WEB_SESSION_FILE" ]]; then
         tkn=$(web_renew "$(cat "$WEB_SESSION_FILE")") || { rc=$?; rm -f "$WEB_SESSION_FILE"; exit "$rc"; }
@@ -1682,7 +1683,7 @@ web_push() {
     tkn=$(browser_portal_token "$(apikey_user_id)" 60 --allow-expired 2>/dev/null) || tkn=$(read_portal_token)
     tkn=$(web_renew "$tkn") || exit $?
     check_shared_token "$tkn"
-    printf '%s\n' "$tkn" | web_ssh "$peer" receive || rc=$?
+    printf '%s\n' "$tkn" | peer_ssh "$peer" "web receive" || rc=$?
     [[ $rc -eq 0 ]] || die "Couldn't send the session to $peer (exit $rc; see above)."
     echo "Sent. On that computer: isardvdi web pull, then the extension's button."
 }
@@ -2509,6 +2510,34 @@ cmd_apikey() {
             [[ ! -t 1 ]] || die "Refusing to print the key on the terminal; use it as \$(isardvdi apikey print)."
             secret_load apikey "$APIKEY_FILE" || die "The keyring can't be read now (locked, or no desktop session)."
             ;;
+        pull)
+            # The same key as the other computer: IsardVDI keeps one key per account, so a key
+            # created here would stop the other's. Over the SSH link of 'web link'.
+            local from="" peer key payload exp mine
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --from) [[ $# -ge 2 ]] || die "--from needs [USER@]HOST"; from="$2"; shift 2 ;;
+                    *) die "Usage: isardvdi apikey pull [--from [USER@]HOST]" ;;
+                esac
+            done
+            load_config
+            peer=$(web_peer "$from")
+            [[ -n "$peer" ]] || die "No other computer yet. Once: isardvdi web link [USER@]HOST [--cloudflare]"
+            key=$(peer_ssh "$peer" "apikey print" </dev/null) || die "Couldn't get the API key from $peer (see above)."
+            key="${key//[[:space:]]/}"
+            payload=$(jwt_payload "$key")
+            jq -e '.session_id == "api-key"' >/dev/null 2>&1 <<< "$payload" \
+                || die "What $peer sent isn't an IsardVDI API key; nothing was changed."
+            exp=$(jwt_exp "$key")
+            [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) )) || die "The API key on $peer has expired; nothing was changed."
+            mine=$(apikey_user_id)
+            if [[ -n "$mine" && $(jq -r '.data.user_id // ""' <<< "$payload") != "$mine" ]]; then
+                die "The API key on $peer belongs to another IsardVDI account than this computer's; nothing was changed."
+            fi
+            store_apikey "$key"
+            unset key
+            echo "API key copied from $peer, in $(secret_where apikey "$APIKEY_FILE"). Valid until $(fmt_epoch "$exp")."
+            ;;
         revoke|delete)
             secret_exists apikey "$APIKEY_FILE" || die "No API key on this computer."
             local server_ok=1
@@ -2856,6 +2885,10 @@ COMMANDS
     apikey print                    Write the key to stdout, for scripts that call the API
                                     themselves: ISARD_KEY=\$(isardvdi apikey print)
     apikey revoke                   Delete the local key and the server's record of it.
+    apikey pull [--from [USER@]HOST]
+                                    Copy the other computer's API key here, over the SSH
+                                    link of 'web link' (IsardVDI keeps one key per account:
+                                    a key created here would stop the other computer's).
     media list                      Your media plus media shared with you (name, kind,
                                     status, mine/shared, id).
     media status <name|id>          One media item as JSON (status, download progress).

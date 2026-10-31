@@ -189,4 +189,34 @@ ssh() { return 255; }
 check "connection fails: says so" '[[ $rc != 0 ]] && grep -q "connection failed" "$T/out"'
 HOME=$REAL_HOME
 
+echo "== 10 apikey pull (the same key as the other computer)"
+export ISARDVDI_KEYRING=0          # never the real keyring: the key goes to the test's file
+apikey_user_id() { echo u1; }
+PCKEY=$(tok "{\"type\":\"external\",\"session_id\":\"api-key\",\"exp\":$((now + 86400 * 300)),\"data\":{\"user_id\":\"u1\"}}")
+ssh() { printf '%s\n' "$@" > "$T/ssh-args"; [[ -n "${SSH_OUT:-}" ]] && printf '%s\n' "$SSH_OUT"; return "${SSH_RC:-0}"; }
+WEB_PEER=isardvdi-peer SSH_OUT=$PCKEY SSH_RC=0
+rm -f "$APIKEY_FILE" "$APIKEY_FILE.in-keyring"
+run cmd_apikey pull
+check "copied and stored privately, the key never printed" \
+    '[[ $rc == 0 && "$(cat "$APIKEY_FILE")" == "$PCKEY" && $(stat -c %a "$APIKEY_FILE") == 600 ]] && ! grep -qF "$PCKEY" "$T/out" && grep -q "Valid until" "$T/out"'
+check "runs 'apikey print' there" 'grep -q "exec \"\$p\" apikey print$" "$T/ssh-args"'
+SSH_OUT=$NEW
+printf 'old' > "$APIKEY_FILE"
+run cmd_apikey pull
+check "not an API key (a session): refused, the old key kept" '[[ $rc != 0 && "$(cat "$APIKEY_FILE")" == old ]]'
+SSH_OUT=$(tok "{\"type\":\"external\",\"session_id\":\"api-key\",\"exp\":$((now + 3600)),\"data\":{\"user_id\":\"someone-else\"}}")
+run cmd_apikey pull
+check "another account's key: refused" '[[ $rc != 0 && "$(cat "$APIKEY_FILE")" == old ]] && grep -q "another IsardVDI account" "$T/out"'
+SSH_OUT=$(tok "{\"type\":\"external\",\"session_id\":\"api-key\",\"exp\":$((now - 60)),\"data\":{\"user_id\":\"u1\"}}")
+run cmd_apikey pull
+check "an expired key: refused" '[[ $rc != 0 && "$(cat "$APIKEY_FILE")" == old ]]'
+SSH_OUT="" SSH_RC=1
+run cmd_apikey pull
+check "the other computer has none / can't be reached: says so" '[[ $rc != 0 ]] && grep -q "Couldn.t get the API key" "$T/out"'
+WEB_PEER=""
+run cmd_apikey pull
+check "no other computer set up: says how" '[[ $rc != 0 ]] && grep -q "web link" "$T/out"'
+check "peer_ssh runs only its fixed commands" '! ( peer_ssh h "rm -rf ~" ) 2>/dev/null'
+unset ISARDVDI_KEYRING
+
 finish

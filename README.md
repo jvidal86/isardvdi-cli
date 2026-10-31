@@ -49,6 +49,11 @@ isardvdi apikey create --from-browser   # key valid 90 days (--days N, at most 3
 isardvdi apikey status
 ```
 
+**Two computers:** IsardVDI keeps one key per account, so creating a key on the second computer
+stops the first one's. Copy it instead: once `isardvdi web link` has set up the other computer (see
+"One web session on both computers"), `isardvdi apikey pull` fetches its key over SSH and checks it's
+the same account.
+
 `--from-browser` creates the key with the portal session of the web browser on this computer, so
 the browser stays logged in (a key can't create its own replacement, and a Microsoft sign-in would
 log the browser out). Have the portal open in your browser when you run it. Firefox and the
