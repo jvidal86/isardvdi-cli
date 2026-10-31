@@ -1462,13 +1462,14 @@ web_keepalive() {
     # ended (sign in again in the browser); 75 no answer or a server error (try again later).
     [[ $# -eq 0 ]] || die "Usage: isardvdi web keepalive"
     load_config
-    local tkn rc=0 resp status body exp left
+    local tkn rc=0 resp status body exp left old_exp
     # The API key's account, if there is one: never renew someone else's session.
     tkn=$(browser_portal_token "$(apikey_user_id)" 60 --allow-expired 2>/dev/null) || rc=$?
     if [[ $rc -ne 0 ]]; then
         err "No portal session in this computer's browsers: sign in to $URL in your browser."
         exit 3
     fi
+    old_exp=$(jwt_exp "$tkn")
     resp=$(curl -sS -X POST -w '\n%{http_code}' --proto =https --connect-timeout 15 --max-time 60 \
         -H @<(printf 'Authorization: Bearer %s\n' "$tkn") -H 'Content-Type: application/json' \
         --data-binary '{}' "$URL/authentication/renew") || resp=$'\n000'
@@ -1480,6 +1481,11 @@ web_keepalive() {
         401|403)
             err "The web session has ended (its maximum time, or nothing renewed it in time): sign in
 again to $URL in your browser."
+            # The browser saves its cookies a little later: right after a sign-in, the one on
+            # disk can still be the old session's.
+            if [[ "$old_exp" =~ ^[0-9]+$ ]] && (( old_exp < $(date +%s) )); then
+                err "If you signed in during the last minute, the browser may not have saved it yet: try again shortly."
+            fi
             exit 4 ;;
         000|5*) err "No answer from $URL (HTTP $status). Try again later."; exit 75 ;;
         *) err "HTTP $status on POST /authentication/renew: $(sanitize "${body:0:200}")"; exit 1 ;;

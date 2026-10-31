@@ -36,6 +36,11 @@ browser_portal_token() { printf '%s' "$TOKEN"; }
 CODE=401 ANSWER='{"error":"invalid_session"}'
 run web_keepalive
 check "session ended (401): exit 4, says sign in again" '[[ $rc == 4 ]] && grep -q "sign in" "$T/out"'
+check "... and, the browser's token being old, that a fresh sign-in may not be saved yet" 'grep -q "may not have saved it yet" "$T/out"'
+TOKEN=$NEW
+run web_keepalive
+check "a still-valid token refused: no such hint" '[[ $rc == 4 ]] && ! grep -q "may not have saved" "$T/out"'
+TOKEN=$(tok "{\"type\":\"login\",\"session_id\":\"s1\",\"exp\":$((now - 600)),\"data\":{\"user_id\":\"u1\"}}")
 CODE=fail
 run web_keepalive
 check "no answer: exit 75" '[[ $rc == 75 ]]'
