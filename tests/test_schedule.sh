@@ -181,6 +181,15 @@ run cmd_schedule add bd2 --at "mon 15:00" --deployment "Windows 11"
 check "no systemd user session: refused before saving" '[[ $rc != 0 ]] && cmp -s "$SCHED_FILE" "$T/before.json"'
 sched_systemctl() { echo "$*" >> "$T/sysctl"; [[ "$1" == show ]] && echo "Tue 2026-11-03 14:58:00 CET"; return 0; }
 
+echo "== 5b list --json (for the tray)"
+sched_systemctl() { [[ "$1" == show ]] && echo "Tue 2026-11-03 14:58:00 CET"; return 0; }
+( sched_list --json ) > "$T/json" 2>&1; rc=$?
+check "valid JSON with every schedule" '[[ $rc == 0 ]] && jq -e "type == \"array\" and length >= 1" "$T/json" >/dev/null'
+check "each with its saved fields, next and last" \
+    'jq -e "all(.[]; has(\"name\") and has(\"slots\") and has(\"before\") and has(\"deployments\") and has(\"enabled\") and has(\"next\") and has(\"last\"))" "$T/json" >/dev/null'
+check "a schedule that is off has no next run" 'jq -e "all(.[]; .enabled or .next == \"\")" "$T/json" >/dev/null'
+sched_systemctl() { echo "$*" >> "$T/sysctl"; [[ "$1" == show ]] && echo "Tue 2026-11-03 14:58:00 CET"; return 0; }
+
 echo "== 6 without systemd"
 unset -f systemctl
 # shellcheck disable=SC2123  # no PATH on purpose: no systemctl to find

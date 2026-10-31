@@ -1945,7 +1945,7 @@ cmd_schedule() {
         remove|rm|delete) sched_remove "$@" ;;
         enable|disable)   sched_enable "$sub" "$@" ;;
         run)              sched_run "$@" ;;
-        *) die "Usage: isardvdi schedule list
+        *) die "Usage: isardvdi schedule list [--json]
        isardvdi schedule add NAME --at \"DAY HH:MM\"... --deployment D... [--group G]... [--before MIN]
        isardvdi schedule edit NAME [--at ...]... [--deployment ...]... [--group ...]... [--no-group]
                                    [--before MIN] [--rename NEW]
@@ -2060,6 +2060,7 @@ sched_enable() {
 
 sched_list() {
     local all names n s unit next last cur
+    if [[ "${1:-}" == --json ]]; then sched_list_json; return; fi
     all=$(sched_json)
     if [[ $# -gt 0 ]]; then names="$1"; else names=$(jq -r '.[].name' <<< "$all"); fi
     if [[ -z "$names" ]]; then
@@ -2085,6 +2086,23 @@ sched_list() {
             (if $last != "" then "  last:    \($last | clean)" else empty end),
             ""' <<< "$s"
     done <<< "$names"
+}
+
+# For programs (the tray): every schedule as saved, plus its timer's next run and its last result.
+# Works without the server: the deployments' names are the ones saved with the schedule.
+sched_list_json() {
+    local all n next last out='[]' s
+    all=$(sched_json)
+    while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        s=$(jq -c --arg n "$n" '.[] | select(.name == $n)' <<< "$all")
+        next=$(sched_systemctl show -p NextElapseUSecRealtime --value "$(sched_unit "$n").timer" 2>/dev/null) || next=""
+        [[ "$next" != "n/a" ]] || next=""
+        last=$(grep -F " [$n] " "$SCHED_LOG" 2>/dev/null | tail -n 1 | sed "s/ \[$n\]//") || last=""
+        out=$(jq -c --argjson s "$s" --arg next "$next" --arg last "$last" "$JQ_CLEAN"'
+            . + [$s + {next: (if $s.enabled then $next else "" end), last: ($last | clean)}]' <<< "$out")
+    done < <(jq -r '.[].name' <<< "$all")
+    jq . <<< "$out"
 }
 
 sched_run() {
@@ -2840,8 +2858,8 @@ COMMANDS
                                     session time, never beyond). The tray can run it
                                     every few minutes. Exit status: 3 no session in the
                                     browser, 4 the session has ended, 75 no answer.
-    schedule [list]                 Your class schedules: when, what they start, next and
-                                    last run.
+    schedule [list] [--json]        Your class schedules: when, what they start, next and
+                                    last run. --json: the same for programs (the tray).
     schedule add NAME --at "DAY HH:MM"... --deployment D... [--group G]... [--before MIN]
                                     Start the deployments' desktops MIN minutes (default 2)
                                     before each class, by a systemd user timer on this
