@@ -90,16 +90,18 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | Command | What it does |
 |---|---|
 | `init` / `login` | Configure / interactive sign-in |
-| `list`, `status <name\|id>` | Show desktops / one desktop's JSON |
-| `start <name\|id>` | Start and wait for state `Started` with an IP |
-| `stop [--force] <name\|id>` | Stop a desktop |
+| `list`, `status <desktop>` | Show desktops / one desktop's JSON |
+| `start <desktop>` | Start and wait for state `Started` with an IP |
+| `stop [--force] <desktop>` | Stop a desktop |
 | `rename <name\|id> <new-name> [--restart]` | Rename a desktop; `--restart` stops a running one first and starts it again |
-| `extend <name\|id>` | Postpone a started desktop's automatic shutdown |
-| `ssh <name\|id> [-l user] [--no-start] [-- ssh-args]` | Auto-start if needed, then SSH in |
+| `extend <desktop>` | Postpone a started desktop's automatic shutdown |
+| `ssh <desktop> [-l user] [--bastion] [--no-start] [-- ssh-args]` | Auto-start if needed, then SSH in (a student's desktop: through the bastion) |
 | `vpn-config` | Download the WireGuard config, print the `wg-quick` command |
 | `vpn-reload` | Rotate keys and bounce the tunnel (**breaks a working tunnel if misused**) |
 | `deployments` | Deployments you own or co-own |
 | `students <deployment>` | A deployment's desktops: student, group, state, IP, id |
+| `deployment start\|stop\|extend <deployment>... [--group G]... [-y] [--wait] [--force]` | A whole class at once: every desktop of the deployments (or of a group), after asking |
+| `bastion status\|on\|off <deployment>` / `--desktop <desktop>`, `bastion key [file.pub]` | SSH through IsardVDI's bastion: switch it on per deployment, set your profile key |
 | `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
 | `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
 | `forget` | Delete every secret stored on this computer (before leaving a shared one) |
@@ -112,7 +114,26 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 IsardVDI cannot take a file upload: `media add` needs a URL the server can download, for example
 a presigned link to an S3 bucket (`aws s3 presign s3://bucket/file.iso --expires-in 604800`).
 
-`<name|id>` is an exact UUID or a case-insensitive substring of the desktop name.
+`<desktop>` is an exact UUID or a case-insensitive substring of the desktop name. `status`, `start`,
+`stop`, `extend`, `ssh` and `console` also take a student's desktop as `<deployment> <student>`:
+
+```sh
+isardvdi start "ASIX.1" abdellah
+isardvdi ssh "ASIX.1" abdellah -- uptime   # a remote command goes after --
+```
+
+### Whole classes
+
+```sh
+isardvdi deployment start ASIX2 --group 26-27_ASIX2 --wait   # every ASIX2 deployment, students only
+isardvdi deployment extend "ASIX.1"                          # postpone everyone's auto-shutdown
+isardvdi deployment stop "ASIX.1"                            # lists what it will stop, then asks
+```
+
+A `<deployment>` here picks every deployment whose name contains it, and `--group` keeps the
+students whose group name contains it (your own desktop in the deployment is in another group).
+The command lists the deployments, the groups and the number of desktops, and asks before
+starting or stopping anything (`-y` skips the question; without a terminal, `-y` is required).
 See `isardvdi help` for environment variables (`ISARDVDI_START_TIMEOUT`, `SSH_USER`, ...).
 
 ## Reaching desktops
@@ -128,6 +149,22 @@ isardvdi ssh my-desktop
 If ping works but `ssh` hangs at the key exchange, large packets are being dropped on the way:
 lower the tunnel MTU with `ISARDVDI_VPN_MTU=1280 isardvdi vpn-config` and restart the tunnel.
 On WSL this is the default.
+
+### Students' desktops: the bastion
+
+The VPN only reaches your own desktops. A student's desktop is reached through IsardVDI's
+**bastion**, an SSH proxy on the internet (`bastion.<portal>`, port 443):
+
+```sh
+isardvdi bastion key ~/.ssh/id_ed25519.pub   # once: the key in your portal profile
+isardvdi bastion on "Ubuntu 24 server ASIX.1" # every desktop of the deployment
+isardvdi ssh "ASIX.1" abdellah
+```
+
+The bastion lets in your profile key (you own the deployment), then logs into the desktop through
+its VPN card with the **user and password stored in the desktop's settings**, so `-l` doesn't
+apply. The desktop must have the WireGuard interface and its VPN card up. Your own desktops use the
+VPN; `isardvdi bastion on --desktop <desktop>` and `ssh --bastion` reach them from anywhere too.
 
 ### Remote control of a Windows desktop over SSH
 
@@ -173,6 +210,12 @@ Then from Linux: `isardvdi ssh <desktop> -l Administrator`. The default shell is
 - `ssh` remembers each desktop's host key under the desktop's id (`HostKeyAlias`), not its VPN IP,
   which IsardVDI reuses. A host key warning therefore means a different machine: don't ignore it.
 - Do not store desktop passwords in the IsardVDI portal (descriptions and credentials are plain text).
+  The bastion is the exception that needs them: it logs into a desktop with its stored credentials.
+- **The bastion is open to the internet.** With it on for a deployment, anyone holding your profile
+  key (or a co-owner's), and each student with their own profile key for their own desktop, gets a
+  shell on those desktops. Through it, `ssh` checks the bastion's host key only: the desktop's own
+  key is checked by the bastion, not by you. Switch it off when the class doesn't need it:
+  `isardvdi bastion off <deployment>`. `bastion key` sends only a public key, and refuses a private one.
 
 ## Tests
 

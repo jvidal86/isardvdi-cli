@@ -513,6 +513,69 @@ wait_state_started() {
     return 124
 }
 
+# The desktop a command acts on: <desktop> (yours, by name or id; any id works) or
+# <deployment> <student> (a student's desktop in a deployment you own). Sets TARGET_ID,
+# TARGET_DEP (that deployment, else empty) and TARGET_OWN (1 when the desktop is yours).
+# Call it directly, not in $(...): it sets these variables in the caller's shell.
+resolve_target() {
+    # Explicit exits: called as "resolve_target ... || die", set -e is off in here.
+    TARGET_DEP="" TARGET_OWN=0 TARGET_ID=""
+    case $# in
+        1) TARGET_ID=$(find_desktop "$1") || exit 1 ;;
+        2) TARGET_DEP=$(find_deployment "$1") || exit 1
+           TARGET_ID=$(deployment_desktops_json "$TARGET_DEP" | match_one "student desktop" "$2" user_name) || exit 1 ;;
+        *) return 2 ;;
+    esac
+    [[ "$TARGET_ID" =~ $UUID_RE ]] || die "Invalid desktop id: $(sanitize "$TARGET_ID")"
+    local own
+    own=$(list_desktops_json | jq --arg id "$TARGET_ID" 'any(.[]; .id == $id)') || exit 1
+    [[ "$own" == true ]] && TARGET_OWN=1
+    return 0
+}
+
+# The target's current state and IP. Your own desktops come from your list; a student's from
+# its deployment's list (get-info reports no IP for them). A student's desktop given by id
+# alone has no known deployment: get-info then gives its state only.
+desktop_now() {
+    if [[ $TARGET_OWN -eq 1 ]]; then
+        desktop_from_list "$TARGET_ID"
+    elif [[ -n "$TARGET_DEP" ]]; then
+        deployment_desktops_json "$TARGET_DEP" | jq --arg id "$TARGET_ID" '.[] | select(.id == $id)'
+    else
+        desktop_detail_json "$TARGET_ID"
+    fi
+}
+
+wait_target() {
+    # wait_target TIMEOUT NEED_IP. Waits for the target to be Started (and, if NEED_IP=1, to
+    # have an IP). Stdout: the IP, or "null". Returns 124 on timeout.
+    local timeout="$1" need_ip="$2" start=$SECONDS shown=-10 d state ip last_state=""
+    while (( SECONDS - start < timeout )); do
+        d=$(poll desktop_now) || exit $?
+        state=$(desktop_state "$d")
+        ip=$(desktop_ip "$d")
+        if [[ "$state" == Started ]] && [[ $need_ip -eq 0 || "$ip" != null ]]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+        if [[ "$state" != "$last_state" ]] || (( SECONDS - start - shown >= 10 )); then
+            printf '  [%3ds/%ds] state=%s ip=%s\n' "$((SECONDS - start))" "$timeout" "$state" "$ip" >&2
+            last_state="$state" shown=$((SECONDS - start))
+        fi
+        sleep 1
+    done
+    return 124
+}
+
+# Asks on the terminal (not stdin, which may be a pipe). $1=question. -y skips it (the caller).
+confirm() {
+    local ans
+    { [[ -r /dev/tty ]] && : < /dev/tty; } 2>/dev/null || die "No terminal to confirm on: add -y."
+    printf '%s [y/N] ' "$1" > /dev/tty
+    read -r ans < /dev/tty || ans=""
+    [[ "$ans" =~ ^[yYsS] ]]   # s: sí
+}
+
 cmd_init() {
     local url username ssh_user jwt
     read -rp "IsardVDI URL [https://elmeuescriptori.gestioeducativa.gencat.cat]: " url
@@ -563,20 +626,27 @@ cmd_list() {
 }
 
 cmd_status() {
-    [[ $# -ge 1 ]] || die "Usage: isardvdi status <name|id>"
-    local id
-    id=$(find_desktop "$1")
-    desktop_detail_json "$id" | jq '{name, status, ip, interfaces}'
+    resolve_target "$@" || die "Usage: isardvdi status <desktop> | <deployment> <student>"
+    local detail now
+    detail=$(desktop_detail_json "$TARGET_ID")
+    now=$(desktop_now)
+    # State and IP from the list (get-info reports no IP for a student's desktop).
+    jq -n --argjson d "$detail" --argjson n "${now:-null}" \
+        '$d + {status: ($n.status // $d.status), ip: ($n.ip // $d.ip)}
+         + (if $n.user_name then {student: $n.user_name, group: $n.group_name} else {} end)
+         | {name, student, group, status, ip, interfaces} | with_entries(select(.value != null))'
 }
 
 cmd_start() {
-    [[ $# -ge 1 ]] || die "Usage: isardvdi start <name|id>"
-    local id ip
-    id=$(find_desktop "$1")
+    resolve_target "$@" || die "Usage: isardvdi start <desktop> | <deployment> <student>"
+    local id="$TARGET_ID" ip
     api_call PUT "/api/v4/item/desktop/$id/start" >/dev/null
     echo "Start requested for $id; waiting up to ${START_TIMEOUT} s ..."
+    # Your own desktops are reached over your VPN: wait for the IP. A student's isn't (the VPN
+    # only reaches your own desktops), and its IP depends on the student's setup: wait for
+    # Started only.
     local rc=0
-    ip=$(wait_started "$id" "$START_TIMEOUT") || rc=$?
+    ip=$(wait_target "$START_TIMEOUT" "$TARGET_OWN") || rc=$?
     case $rc in
         0)   echo "Started: ip=$ip" ;;
         124) die "Timed out after ${START_TIMEOUT} s. Check 'isardvdi status' or set ISARDVDI_START_TIMEOUT=300." ;;
@@ -629,11 +699,17 @@ Stop it first (isardvdi stop $id), or add --restart."
 }
 
 cmd_stop() {
-    local force=0
-    if [[ "${1:-}" == "--force" ]]; then force=1; shift; fi
-    [[ $# -ge 1 ]] || die "Usage: isardvdi stop [--force] <name|id>"
-    local id
-    id=$(find_desktop "$1")
+    local force=0 pos=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=1 ;;
+            -*) die "Unknown flag: $1" ;;
+            *) pos+=("$1") ;;
+        esac
+        shift
+    done
+    resolve_target ${pos[@]+"${pos[@]}"} || die "Usage: isardvdi stop [--force] <desktop> | <deployment> <student>"
+    local id="$TARGET_ID"
     api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null
     echo "Stop requested for $id"
     if [[ $force -eq 1 ]]; then
@@ -644,11 +720,10 @@ cmd_stop() {
 }
 
 cmd_extend() {
-    [[ $# -ge 1 ]] || die "Usage: isardvdi extend <name|id>"
-    local id errmsg code shutdown
-    id=$(find_desktop "$1")
+    resolve_target "$@" || die "Usage: isardvdi extend <desktop> | <deployment> <student>"
+    local id="$TARGET_ID" errmsg code shutdown
     if errmsg=$(api_call PUT "/api/v4/item/desktop/$id/extend-timeout" 2>&1 >/dev/null); then
-        shutdown=$(desktop_from_list "$id" | jq -r '.scheduled.shutdown // empty' 2>/dev/null)
+        shutdown=$(desktop_now | jq -r '.scheduled.shutdown // empty' 2>/dev/null) || shutdown=""
         if [[ -n "$shutdown" ]] && shutdown=$(date -d "$shutdown" '+%Y-%m-%d %H:%M' 2>/dev/null); then
             echo "Auto-shutdown extended: $shutdown"
         else
@@ -695,20 +770,37 @@ cmd_viewer() {
 }
 
 cmd_ssh() {
-    local no_start=0 user="" target="" args=()
+    local no_start=0 bastion=0 user="" pos=() args=()
+    local usage="Usage: isardvdi ssh <desktop> | <deployment> <student> [-l USER] [--bastion] [--no-start] [-- SSH-ARGS...]"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-start) no_start=1; shift ;;
+            --bastion) bastion=1; shift ;;
             -l) [[ $# -ge 2 ]] || die "-l needs a username"; user="$2"; shift 2 ;;
             --) shift; args=("$@"); break ;;
             -*) die "Unknown flag: $1" ;;
-            *) if [[ -z "$target" ]]; then target="$1"; shift; else args+=("$1"); shift; fi ;;
+            *) pos+=("$1"); shift ;;
         esac
     done
-    [[ -n "$target" ]] || die "Usage: isardvdi ssh <name|id> [-l user] [--no-start] [-- ssh-args...]"
+    case ${#pos[@]} in
+        0) die "$usage" ;;
+        1) ;;
+        2) # Older versions passed a second word to ssh as the remote command.
+           if [[ ! "${pos[0]}" =~ $UUID_RE ]] && ! list_deployments_json | jq -e --arg q "${pos[0]}" \
+                'any(.[]; .name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))' >/dev/null; then
+               die "No deployment matches \"${pos[0]}\". To run a command on a desktop, put it after --:
+    isardvdi ssh $(printf '%q' "${pos[0]}") -- $(printf '%q' "${pos[1]}")"
+           fi ;;
+        *) die "Too many arguments. Put the remote command after --.
+$usage" ;;
+    esac
+    resolve_target "${pos[@]}"
+    # The VPN only reaches your own desktops: a student's is reached through the bastion.
+    if [[ $bastion -eq 1 || $TARGET_OWN -eq 0 ]]; then
+        ssh_bastion "$user" "$no_start" "${args[@]}"
+    fi
 
-    local id d state ip
-    id=$(find_desktop "$target")
+    local id="$TARGET_ID" d state ip
     d=$(desktop_from_list "$id")
     state=$(desktop_state "$d")
     ip=$(desktop_ip "$d")
@@ -957,6 +1049,396 @@ cmd_students() {
         | @tsv' | column -t -s$'\t'
 }
 
+# ---- Whole deployments: start, stop or extend every desktop (or a group's) at once ----------
+
+# Every deployment whose id is one of the queries or whose name contains one (case-insensitive),
+# as a JSON array. A query that matches nothing is an error. Several matches are fine: the
+# caller lists them before acting.
+deployments_matching() {
+    local all q deps
+    all=$(list_deployments_json) || exit 1
+    for q in "$@"; do
+        jq -e --arg q "$q" 'any(.[]; .id == $q
+            or (.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase)))' \
+            >/dev/null <<< "$all" || die "No deployment matches \"$q\". See: isardvdi deployments"
+    done
+    deps=$(jq -c --args '[.[] | . as $d | select(any($ARGS.positional[]; . as $q | $d.id == $q
+            or ($d.name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))))]' \
+            "$@" <<< "$all")
+    # Ids go into URLs.
+    jq -e --arg re "$UUID_RE" 'all(.[]; .id | tostring | test($re))' >/dev/null <<< "$deps" \
+        || die "The server returned an invalid deployment id."
+    printf '%s' "$deps"
+}
+
+cmd_deployment() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        start|stop|extend) deployment_bulk "$sub" "$@" ;;
+        list|"")           cmd_deployments ;;
+        *) die "Usage: isardvdi deployment start|stop|extend <deployment>... [--group NAME]... [-y]
+       (stop also takes --force; start and stop take --wait)" ;;
+    esac
+}
+
+deployment_bulk() {
+    local action="$1"; shift
+    local yes=0 force=0 wait=0 queries=() groups=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes) yes=1; shift ;;
+            --force)  [[ "$action" == stop ]] || die "--force only applies to stop"; force=1; shift ;;
+            --wait)   [[ "$action" != extend ]] || die "--wait only applies to start and stop"; wait=1; shift ;;
+            --group)  [[ $# -ge 2 ]] || die "--group needs a name"; groups+=("$2"); shift 2 ;;
+            -*) die "Unknown flag: $1" ;;
+            *) queries+=("$1"); shift ;;
+        esac
+    done
+    (( ${#queries[@]} )) || die "Usage: isardvdi deployment $action <deployment>... [--group NAME]... [-y]"
+
+    local deps n i dep name desktops selected todo plan="" total=0 g
+    deps=$(deployments_matching "${queries[@]}") || exit 1
+    n=$(jq length <<< "$deps")
+    # Per deployment: its desktops in the chosen groups, and the ones the action applies to.
+    local -a dep_ids dep_names dep_todo dep_desk
+    for (( i = 0; i < n; i++ )); do
+        dep=$(jq -r --argjson i "$i" '.[$i].id' <<< "$deps")
+        name=$(jq -r --argjson i "$i" "$JQ_CLEAN"' .[$i].name | clean' <<< "$deps")
+        desktops=$(deployment_desktops_json "$dep") || exit 1
+        selected=$(jq -c --args '[.[] | select(($ARGS.positional | length) == 0
+            or (.group_name // "" | tostring | ascii_downcase) as $g
+               | any($ARGS.positional[]; ascii_downcase as $q | $g | contains($q)))]' \
+            ${groups[@]+"${groups[@]}"} <<< "$desktops")
+        todo=$(jq -c --arg a "$action" '[.[] | select(.status as $s
+            | if $a == "start" then ($s == "Stopped" or $s == "Failed")
+              elif $a == "stop" then ($s != "Stopped" and $s != "Failed")
+              else $s == "Started" end)]' <<< "$selected")
+        dep_ids+=("$dep") dep_names+=("$name") dep_todo+=("$todo") dep_desk+=("$desktops")
+        total=$(( total + $(jq length <<< "$todo") ))
+        plan+=$(printf '  %-32s %3s of %3s desktops' "$name" "$(jq length <<< "$todo")" "$(jq length <<< "$selected")")
+        if (( ${#groups[@]} )); then
+            plan+="   groups: $(jq -r "$JQ_CLEAN"' [.[].group_name // "?" | clean] | unique | join(", ")' <<< "$selected")"
+        fi
+        plan+=$'\n'
+    done
+    if (( ${#groups[@]} )); then
+        # A --group that picks nothing is most likely a typo: say which groups exist.
+        for g in "${groups[@]}"; do
+            local hit=0
+            for (( i = 0; i < n; i++ )); do
+                jq -e --arg q "$g" \
+                    'any(.[]; .group_name // "" | tostring | ascii_downcase | contains($q | ascii_downcase))' \
+                    >/dev/null <<< "${dep_desk[$i]}" && { hit=1; break; }
+            done
+            [[ $hit -eq 1 ]] || die "No desktop of these deployments is in a group matching \"$g\". Groups: $(
+                printf '%s\n' "${dep_desk[@]}" \
+                | jq -rs "$JQ_CLEAN"' [.[][] | .group_name // empty | clean] | unique | join(", ")')"
+        done
+    fi
+
+    local verb
+    case "$action" in start) verb="Start" ;; stop) verb="Stop" ;; extend) verb="Extend the auto-shutdown of" ;; esac
+    if (( total == 0 )); then
+        printf 'Nothing to do: no desktop to %s in:\n%s' "$action" "$plan"
+        return 0
+    fi
+    printf '%s %d desktop(s):\n%s' "$verb" "$total" "$plan" >&2
+    if [[ "$action" != extend && $yes -eq 0 ]]; then
+        confirm "Go ahead?" || die "Cancelled."
+    fi
+
+    local ok=0 failed=0 id who errmsg code
+    for (( i = 0; i < n; i++ )); do
+        dep="${dep_ids[$i]}"
+        todo="${dep_todo[$i]}"
+        [[ $(jq length <<< "$todo") -gt 0 ]] || continue
+        # The whole deployment in one request when no group narrows it down.
+        if [[ "$action" != extend ]] && (( ${#groups[@]} == 0 )); then
+            local body=""
+            [[ "$action" == stop ]] && body=$(jq -nc --argjson f "$([[ $force -eq 1 ]] && echo true || echo false)" '{force: $f}')
+            if errmsg=$(api_call PUT "/api/v4/item/deployment/$dep/$action" "$body" 2>&1 >/dev/null); then
+                ok=$(( ok + $(jq length <<< "$todo") ))
+            else
+                failed=$(( failed + $(jq length <<< "$todo") ))
+                err "${dep_names[$i]}: $errmsg"
+            fi
+            continue
+        fi
+        local path
+        case "$action" in start) path=start ;; stop) path=stop ;; extend) path=extend-timeout ;; esac
+        while IFS=$'\t' read -r id who; do
+            [[ "$id" =~ $UUID_RE ]] || { failed=$((failed + 1)); err "Skipped an invalid desktop id: $(sanitize "$id")"; continue; }
+            if errmsg=$(api_call PUT "/api/v4/item/desktop/$id/$path" 2>&1 >/dev/null); then
+                ok=$((ok + 1))
+                if [[ $force -eq 1 ]]; then   # as 'stop --force': repeat the stop
+                    sleep 0.5
+                    api_call PUT "/api/v4/item/desktop/$id/stop" >/dev/null 2>&1 || true
+                fi
+            else
+                failed=$((failed + 1))
+                code=$(grep -oE '"description_code": ?"[a-z_]+"' <<< "$errmsg" | grep -oE '[a-z_]+"$' | tr -d '"') || true
+                err "  $who: ${code:-$errmsg}"
+            fi
+        done < <(jq -r "$JQ_CLEAN"' .[] | [.id, (.user_name // .name // "?")] | map(clean) | @tsv' <<< "$todo")
+    done
+    local tail="."
+    [[ $failed -eq 0 ]] || tail=", $failed failed."
+    case "$action" in
+        start)  echo "Start requested for $ok desktop(s)$tail" ;;
+        stop)   echo "Stop requested for $ok desktop(s)$tail" ;;
+        extend) echo "Auto-shutdown extended for $ok desktop(s)$tail" ;;
+    esac
+    [[ $failed -eq 0 ]] || [[ $ok -gt 0 ]] || exit 1
+
+    if [[ $wait -eq 1 && $ok -gt 0 ]]; then
+        deployment_wait "$action" "${dep_ids[@]}" -- "${dep_todo[@]}"
+    elif [[ "$action" != extend ]]; then
+        echo "Follow it with: isardvdi students <deployment>"
+    fi
+}
+
+deployment_wait() {
+    # deployment_wait start|stop DEP... -- TODO-JSON... Waits until each desktop acted on is
+    # Started (start) or Stopped (stop); Failed ends the wait for that desktop too.
+    local action="$1"; shift
+    local deps=() todos=() ids want start=$SECONDS shown=-10 states pending
+    while [[ "$1" != -- ]]; do deps+=("$1"); shift; done
+    shift; todos=("$@")
+    ids=$(printf '%s\n' "${todos[@]}" | jq -sc '[.[][] | .id]')
+    [[ "$action" == start ]] && want=Started || want=Stopped
+    while :; do
+        states=$(for d in "${deps[@]}"; do poll deployment_desktops_json "$d" || exit $?; done \
+            | jq -sc --argjson ids "$ids" '[.[][] | select(.id as $i | $ids | index($i))]')
+        # Counted from the ids: a deployment whose list didn't come back counts as pending.
+        pending=$(jq --arg w "$want" --argjson ids "$ids" \
+            '($ids | length) - ([.[] | select(.status == $w or .status == "Failed")] | length)' <<< "$states")
+        if [[ "$pending" == 0 ]]; then
+            echo "All $want. Failed: $(jq '[.[] | select(.status == "Failed")] | length' <<< "$states")."
+            return 0
+        fi
+        (( SECONDS - start < START_TIMEOUT )) || die "Timed out after ${START_TIMEOUT} s: $pending desktop(s) not $want yet.
+Check with: isardvdi students <deployment> (or set ISARDVDI_START_TIMEOUT)"
+        if (( SECONDS - start - shown >= 10 )); then
+            shown=$((SECONDS - start))
+            printf '  [%3ds/%ds] %s desktop(s) not %s yet\n' "$shown" "$START_TIMEOUT" "$pending" "$want" >&2
+        fi
+        sleep 3
+    done
+}
+
+# ---- Bastion: SSH from the internet into a desktop, through IsardVDI's SSH proxy -------------
+# The bastion checks your key (the one in your portal profile: 'isardvdi bastion key'), then logs
+# into the desktop over its VPN IP with the user and password stored in the desktop's settings.
+
+bastion_conn() {
+    # bastion_conn DESKTOP-ID. Stdout: "TARGET HOST PORT", checked, or dies saying why not.
+    local info target host port
+    info=$(api_get "/api/v4/item/desktop/$1/bastion/active") || exit 1
+    # SSH off first: a desktop with no bastion target yet reports bastion_enabled false too.
+    [[ $(jq -r '.ssh.enabled' <<< "$info") == true ]] || return 3
+    [[ $(jq -r '.bastion_enabled' <<< "$info") == true ]] || die "The bastion is switched off on this portal."
+    target=$(jq -r '.id // ""' <<< "$info")
+    host=$(jq -r '.bastion_domain // ""' <<< "$info")
+    port=$(jq -r '.bastion_ssh_port // "22" | tostring' <<< "$info")
+    # These reach ssh's command line.
+    [[ "$target" =~ $UUID_RE ]] || die "The server returned an invalid bastion target: $(sanitize "$target")"
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
+        || die "The server returned an invalid bastion host: $(sanitize "$host")"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )) \
+        || die "The server returned an invalid bastion port: $(sanitize "$port")"
+    printf '%s %s %s' "$target" "$host" "$port"
+}
+
+bastion_enable_hint() {
+    if [[ $TARGET_OWN -eq 1 ]]; then
+        echo "isardvdi bastion on --desktop $TARGET_ID"
+    elif [[ -n "$TARGET_DEP" ]]; then
+        echo "isardvdi bastion on $TARGET_DEP   (for the whole deployment)"
+    else
+        echo "isardvdi bastion on <deployment>"
+    fi
+}
+
+ssh_bastion() {
+    # ssh_bastion USER NO_START [SSH-ARGS...]. SSH into TARGET_ID through the bastion. Never returns.
+    local user="$1" no_start="$2"; shift 2
+    [[ -z "$user" ]] || die "-l can't be used through the bastion: it logs in as the user stored in the
+desktop's settings in the portal (its credentials), not as one you choose."
+    local conn rc=0 key
+    conn=$(bastion_conn "$TARGET_ID") || rc=$?
+    [[ $rc -ne 3 ]] || die "SSH through the bastion is off for this desktop. Switch it on with:
+    $(bastion_enable_hint)"
+    [[ $rc -eq 0 ]] || exit "$rc"
+    key=$(api_get "/api/v4/item/user/bastion-ssh-key" | jq -r '.ssh_key // ""') || exit 1
+    [[ -n "$key" ]] || die "Your portal profile has no SSH key, and the bastion only lets in that key.
+Add your public key: isardvdi bastion key ~/.ssh/id_ed25519.pub"
+
+    # The bastion only connects to a Started desktop that has its VPN IP.
+    local d state ip
+    d=$(desktop_now)
+    state=$(desktop_state "$d")
+    if [[ "$state" != Started ]]; then
+        [[ $no_start -eq 0 ]] || die "Desktop not Started (state=$state). --no-start requested, refusing to start."
+        if [[ "$state" == Stopped || "$state" == Failed ]]; then
+            echo "Desktop is $state — starting it..." >&2
+            api_call PUT "/api/v4/item/desktop/$TARGET_ID/start" >/dev/null
+        else
+            echo "Desktop is $state — waiting for it to come up..." >&2
+        fi
+    fi
+    if [[ $TARGET_OWN -eq 1 || -n "$TARGET_DEP" ]]; then
+        rc=0
+        ip=$(wait_target "$START_TIMEOUT" 1) || rc=$?
+        [[ $rc -ne 124 ]] || die "No VPN IP after ${START_TIMEOUT} s. The bastion reaches the desktop through its
+WireGuard VPN card: check inside it that the card is up and on DHCP (isardvdi console ...)."
+        [[ $rc -eq 0 ]] || exit "$rc"
+    else
+        # A student's desktop given by id: no deployment, so no IP to watch. Started is enough.
+        rc=0
+        wait_target "$START_TIMEOUT" 0 >/dev/null || rc=$?
+        [[ $rc -ne 124 ]] || die "Timed out after ${START_TIMEOUT} s waiting for the desktop to start."
+        [[ $rc -eq 0 ]] || exit "$rc"
+    fi
+
+    local target host port
+    read -r target host port <<< "$conn"
+    echo "Connecting through the bastion ($host:$port) ..." >&2
+    # One host key for every desktop: the bastion's. The desktop's own key is checked by the
+    # bastion, not by you. ForwardAgent/ForwardX11=no as for VPN connections.
+    DISPLAY="" exec ssh -p "$port" -o ForwardAgent=no -o ForwardX11=no "$target@$host" "$@"
+}
+
+cmd_bastion() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        status)  bastion_status "$@" ;;
+        on|off)  bastion_set "$sub" "$@" ;;
+        key)     bastion_key "$@" ;;
+        *) die "Usage: isardvdi bastion status <deployment> [<student>] | --desktop <desktop>
+       isardvdi bastion on|off <deployment>... [--port N] | --desktop <desktop> [--port N]
+       isardvdi bastion key [PUBLIC-KEY-FILE]" ;;
+    esac
+}
+
+# Bastion arguments: --desktop <desktop> (one of yours), or deployments (with on/off) / a
+# deployment and maybe a student (with status). Sets B_DESKTOP, B_PORT and the array B_POS.
+bastion_args() {
+    B_DESKTOP="" B_PORT="" B_POS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --desktop) [[ $# -ge 2 ]] || die "--desktop needs a desktop"; B_DESKTOP="$2"; shift 2 ;;
+            --port) [[ $# -ge 2 && "$2" =~ ^[0-9]{1,5}$ ]] && (( $2 >= 1 && $2 <= 65535 )) \
+                        || die "--port needs a port number (1-65535)"
+                    B_PORT="$2"; shift 2 ;;
+            -*) die "Unknown flag: $1" ;;
+            *) B_POS+=("$1"); shift ;;
+        esac
+    done
+}
+
+bastion_status() {
+    bastion_args "$@"
+    [[ -z "$B_PORT" ]] || die "--port only applies to on"
+    if [[ -n "$B_DESKTOP" || ${#B_POS[@]} -eq 2 ]]; then
+        if [[ -n "$B_DESKTOP" ]]; then
+            [[ ${#B_POS[@]} -eq 0 ]] || die "Give either --desktop or a deployment, not both."
+            resolve_target "$B_DESKTOP"
+        else
+            resolve_target "${B_POS[@]}"
+        fi
+        local conn rc=0 target host port
+        conn=$(bastion_conn "$TARGET_ID") || rc=$?
+        if [[ $rc -eq 3 ]]; then
+            echo "SSH through the bastion: off. Switch it on with: $(bastion_enable_hint)"
+            return 0
+        fi
+        [[ $rc -eq 0 ]] || exit "$rc"
+        read -r target host port <<< "$conn"
+        echo "SSH through the bastion: on."
+        if [[ -n "$B_DESKTOP" ]]; then
+            echo "Connect with: isardvdi ssh $(printf '%q' "$B_DESKTOP")"
+        else
+            echo "Connect with: isardvdi ssh $(printf '%q %q' "${B_POS[0]}" "${B_POS[1]}")"
+        fi
+        echo "         (or: ssh $target@$host -p $port)"
+        return 0
+    fi
+    [[ ${#B_POS[@]} -eq 1 ]] || die "Usage: isardvdi bastion status <deployment> [<student>] | --desktop <desktop>"
+    local dep cfg
+    dep=$(find_deployment "${B_POS[0]}") || exit 1
+    cfg=$(api_get "/api/v4/item/deployment/$dep/bastion") || exit 1
+    jq -r '"SSH through the bastion: \(if .ssh.enabled then "on" else "off" end) (desktop port \(.ssh.port // 22))",
+           "HTTP through the bastion: \(if .http.enabled then "on" else "off" end)"' <<< "$cfg"
+}
+
+bastion_set() {
+    local action="$1"; shift
+    local on=false
+    [[ "$action" == on ]] && on=true
+    bastion_args "$@"
+    if [[ -n "$B_DESKTOP" ]]; then
+        [[ ${#B_POS[@]} -eq 0 ]] || die "Give either --desktop or deployments, not both."
+        resolve_target "$B_DESKTOP"
+        [[ $TARGET_OWN -eq 1 ]] || die "That desktop isn't yours. A student's desktop gets the bastion from its
+deployment: isardvdi bastion $action <deployment>"
+        # Read, change ssh, write back: this endpoint replaces the keys, HTTP settings and domains
+        # it is given, so pass the current ones along.
+        local cur new
+        cur=$(api_get "/api/v4/item/desktop/$TARGET_ID/bastion") || exit 1
+        new=$(jq -c --argjson on "$on" --arg port "$B_PORT" '{
+            ssh: ((.ssh // {}) + {enabled: $on, authorized_keys: (.ssh.authorized_keys // [])}
+                  + (if $port != "" then {port: ($port | tonumber)} else {} end)),
+            http: (.http // {enabled: false}),
+            domains: (.domains // [])}' <<< "$cur")
+        api_call PUT "/api/v4/item/desktop/$TARGET_ID/bastion" "$new" >/dev/null
+        echo "SSH through the bastion is now $action for $TARGET_ID."
+        [[ "$action" == off ]] || echo "Connect with: isardvdi ssh $(printf '%q' "$B_DESKTOP") --bastion"
+        return 0
+    fi
+    (( ${#B_POS[@]} )) || die "Usage: isardvdi bastion on|off <deployment>... [--port N] | --desktop <desktop> [--port N]"
+    local q dep cur new name
+    for q in "${B_POS[@]}"; do
+        dep=$(find_deployment "$q") || exit 1
+        cur=$(api_get "/api/v4/item/deployment/$dep/bastion") || exit 1
+        new=$(jq -c --argjson on "$on" --arg port "$B_PORT" '{
+            ssh: {enabled: $on, port: (if $port != "" then ($port | tonumber) else (.ssh.port // 22) end)},
+            http: (.http // {enabled: false})}' <<< "$cur")
+        api_call PUT "/api/v4/item/deployment/$dep/bastion" "$new" >/dev/null
+        name=$(list_deployments_json | jq -r --arg id "$dep" "$JQ_CLEAN"' .[] | select(.id == $id) | .name | clean')
+        echo "SSH through the bastion is now $action for every desktop of \"$name\"."
+    done
+    [[ "$action" == off ]] || echo "Connect with: isardvdi ssh <deployment> <student>"
+}
+
+bastion_key() {
+    local cur
+    if [[ $# -eq 0 ]]; then
+        cur=$(api_get "/api/v4/item/user/bastion-ssh-key" | jq -r '.ssh_key // ""') || exit 1
+        if [[ -z "$cur" ]]; then
+            echo "No SSH key in your portal profile. Add one: isardvdi bastion key ~/.ssh/id_ed25519.pub"
+        else
+            printf '%s\n' "$cur" | ssh-keygen -lf - 2>/dev/null \
+                || echo "A key is set, but it couldn't be read: $(sanitize "${cur:0:40}")..."
+        fi
+        return 0
+    fi
+    [[ $# -eq 1 ]] || die "Usage: isardvdi bastion key [PUBLIC-KEY-FILE]"
+    local file="$1" key
+    [[ -f "$file" ]] || die "No such file: $file"
+    # Only a public key leaves this computer: never send a private key by mistake.
+    grep -q 'PRIVATE KEY' "$file" && die "$file is a PRIVATE key. Give the .pub file next to it."
+    key=$(grep -vE '^[[:space:]]*(#|$)' "$file" | head -n 1)
+    [[ "$(grep -cvE '^[[:space:]]*(#|$)' "$file")" -eq 1 ]] || die "$file must hold exactly one public key."
+    [[ "$key" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\ [A-Za-z0-9+/=]+(\ .*)?$ ]] \
+        || die "$file doesn't look like an SSH public key."
+    printf '%s\n' "$key" | ssh-keygen -lf - >/dev/null 2>&1 || die "$file doesn't look like an SSH public key."
+    api_call PUT "/api/v4/item/user/bastion-ssh-key" "$(jq -nc --arg k "$key" '{ssh_key: $k}')" >/dev/null
+    echo "Your portal profile's SSH key is now: $(printf '%s\n' "$key" | ssh-keygen -lf -)"
+    echo "The bastion lets this key into your desktops and your deployments' desktops."
+}
+
 # Viewer files come from the server, and IsardVDI's defaults share local devices with the guest
 # (RDP: printers, smartcards, clipboard). The guest may be controlled by someone else (a student),
 # so these filters turn every device redirection off. stdin → stdout; $1=1 allows the clipboard.
@@ -990,20 +1472,12 @@ cmd_console() {
         shift
     done
 
-    local id
-    case ${#pos[@]} in
-        1) id=$(find_desktop "${pos[0]}") ;;
-        2) local dep
-           dep=$(find_deployment "${pos[0]}")
-           id=$(deployment_desktops_json "$dep" | match_one "student desktop" "${pos[1]}" user_name) ;;
-        *) die "Usage: isardvdi console <desktop> | <deployment> <student> [--browser|--rdp] [--clipboard] [--no-start]" ;;
-    esac
+    resolve_target ${pos[@]+"${pos[@]}"} \
+        || die "Usage: isardvdi console <desktop> | <deployment> <student> [--browser|--rdp] [--clipboard] [--no-start]"
+    local id="$TARGET_ID"
     # Someone else's desktop (a student's) is controlled by its user, who could read whatever you
     # copy while the console is open: share the clipboard only with your own, unless asked.
-    if [[ -z "$clipboard" ]]; then
-        clipboard=0
-        list_desktops_json | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null && clipboard=1
-    fi
+    [[ -n "$clipboard" ]] || clipboard=$TARGET_OWN
 
     local state
     state=$(desktop_state "$(desktop_detail_json "$id")")
@@ -1518,27 +1992,34 @@ COMMANDS
                                     stops working, e.g. Microsoft asks for the password).
                                     Refused while an API key is in use.
     list                            List your desktops (name, state, IP, id).
-    status <name|id>                Show one desktop's details as JSON.
-    start  <name|id>                Start a desktop and wait until it reaches state
-                                    "Started" with an IP. See ISARDVDI_START_TIMEOUT.
-    stop   [--force] <name|id>      Stop a desktop. --force re-issues stop after 0.5 s.
+    status <desktop>                Show one desktop's details as JSON.
+    start  <desktop>                Start a desktop and wait until it reaches state
+                                    "Started" with an IP (a student's: "Started" only).
+                                    See ISARDVDI_START_TIMEOUT.
+    stop   [--force] <desktop>      Stop a desktop. --force re-issues stop after 0.5 s.
     rename <name|id> <new-name> [--restart]
                                     Rename a desktop (4-50 letters, digits, spaces, . _ -).
                                     IsardVDI only edits a stopped desktop: --restart stops a
                                     running one, renames it and starts it again.
-    extend <name|id>                Postpone a started desktop's automatic shutdown and
+    extend <desktop>                Postpone a started desktop's automatic shutdown and
                                     print the new time (as the portal's "extend" button).
     viewer <name|id> [FILE.vv]      Save the SPICE connection file of a started desktop
                                     (mode 600, one-time password inside) and print its
                                     path. Open it with remote-viewer (virt-viewer).
-    ssh    <name|id> [-l USER] [--no-start] [-- SSH-ARGS...]
+    ssh    <desktop> [-l USER] [--bastion] [--no-start] [-- SSH-ARGS...]
                                     SSH into a (running) desktop. If it isn't
                                     running, it's auto-started first (suppress with
-                                    --no-start). SSH user resolution order:
+                                    --no-start). Your own desktops are reached over
+                                    the VPN; SSH user resolution order:
                                       1. -l flag
                                       2. SSH_USER from config / environment
                                       3. fallback "isard"
-                                    Anything after -- is forwarded to ssh.
+                                    A student's desktop is reached through the bastion
+                                    (the VPN only reaches yours), as is yours with
+                                    --bastion: it logs in as the user stored in the
+                                    desktop's settings, so -l doesn't apply.
+                                    Anything after -- is forwarded to ssh (a remote
+                                    command too: isardvdi ssh hermes -- uptime).
     vpn-config                      Download the IsardVDI WireGuard config to
                                     ~/.config/isardvdi-cli/isard-vpn.conf and print
                                     the sudo command to bring it up.
@@ -1547,6 +2028,28 @@ COMMANDS
     deployments                     List the deployments you own or co-own.
     students <deployment>           List a deployment's desktops: student, group, state,
                                     IP, desktop id.
+    deployment start|stop|extend <deployment>... [--group NAME]... [-y]
+               [--wait] [--force]   Start, stop, or postpone the auto-shutdown of every
+                                    desktop of the deployments (a whole class at once).
+                                    Each <deployment> picks every deployment whose name
+                                    contains it ("ASIX2" picks all of ASIX2's), and
+                                    --group keeps only the students whose group contains
+                                    NAME (repeatable). Lists what it will do and asks
+                                    first (-y: don't ask). --wait: wait until all are
+                                    Started / Stopped. --force (stop): stop at once,
+                                    without a clean shutdown of the guest.
+    bastion status <deployment> [<student>] | --desktop <desktop>
+                                    Whether SSH through the bastion is on.
+    bastion on|off <deployment>... [--port N] | --desktop <desktop> [--port N]
+                                    Switch SSH through the bastion on or off for every
+                                    desktop of a deployment, or for one of your own
+                                    desktops. --port: the desktop's SSH port (22).
+                                    The bastion (bastion.<portal>, port 443) is open to
+                                    the internet: it lets in the key in your profile
+                                    (and each student's own key into their desktop),
+                                    then logs in with the desktop's stored password.
+    bastion key [PUBLIC-KEY-FILE]   Show, or set, the SSH public key in your portal
+                                    profile: the one the bastion lets in.
     console <desktop> | <deployment> <student> [--browser|--rdp] [--clipboard] [--no-start]
                                     Open a desktop's console, auto-starting it if needed.
                                     Works for your students' desktops too. Default:
@@ -1598,10 +2101,12 @@ COMMANDS
     help, -h, --help                This help.
 
 DESKTOP NAME MATCHING
-    A <name|id> argument is matched as either an exact UUID, or a case-insensitive
+    A <desktop> argument is matched as either an exact UUID, or a case-insensitive
     substring of the desktop name. "hermes" matches "hermes DAW2 server".
     If a substring matches more than one desktop, the candidates are listed and
     the command exits 1.
+    status, start, stop, extend, ssh and console also take a student's desktop as
+    <deployment> <student>: isardvdi start "ASIX.1" abdellah.
 
 ENVIRONMENT
     ISARDVDI_PASSWORD        Optional: auto-fills the Microsoft password for ONE login run
@@ -1646,6 +2151,10 @@ EXAMPLES
     isardvdi ssh hermes -l ubuntu -- -p 2222
     ISARDVDI_START_TIMEOUT=300 isardvdi ssh hermes
     isardvdi vpn-reload
+    isardvdi deployment start "ASIX2" --group 26-27_ASIX2 --wait
+    isardvdi deployment stop "Ubuntu 24 server ASIX.1" -y
+    isardvdi bastion on "Ubuntu 24 server ASIX.1"
+    isardvdi ssh "ASIX.1" abdellah
     isardvdi media add "tiny11 Core x64" "https://s3.example.com/bucket/tiny11.iso?X-Amz-..."
     isardvdi media desktop tiny11 "Install tiny11" --os win11
     isardvdi template create "Install tiny11" "Practica install tiny11" --group 26-27_ASIX1
@@ -1687,6 +2196,8 @@ case "$cmd" in
     vpn-config|vpn)  cmd_vpn_config "$@" ;;
     vpn-reload|vpn-restart) cmd_vpn_reload "$@" ;;
     deployments|deps) cmd_deployments "$@" ;;
+    deployment|dep)  cmd_deployment "$@" ;;
+    bastion)         cmd_bastion "$@" ;;
     students)        cmd_students "$@" ;;
     console)         cmd_console "$@" ;;
     apikey|api-key)  cmd_apikey "$@" ;;
