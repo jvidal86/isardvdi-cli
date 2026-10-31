@@ -103,6 +103,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `deployment start\|stop\|extend <deployment>... [--group G]... [-y] [--wait] [--force]` | A whole class at once: every desktop of the deployments (or of a group), after asking |
 | `bastion status\|on\|off <deployment>` / `--desktop <desktop>`, `bastion key [file.pub]` | SSH through IsardVDI's bastion: switch it on per deployment, set your profile key |
 | `schedule list\|add\|edit\|enable\|disable\|remove\|run` | Start deployments a few minutes before each class (systemd timer) |
+| `web keepalive` | Renew your browser's portal session, so the portal doesn't ask you to sign in again (up to its maximum session time); the tray runs it every 10 min |
 | `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
 | `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
 | `forget` | Delete every secret stored on this computer (before leaving a shared one) |

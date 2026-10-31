@@ -61,15 +61,18 @@ def claims(tkn):
         return None
 
 
-def usable(tkn, user_id):
-    """A portal login token (not an API key), valid for at least another minute, for user_id."""
+def usable(tkn, user_id, expired_ok=False):
+    """A portal login token (not an API key), valid for at least another minute, for user_id.
+    expired_ok: an expired one too (up to a day), which the portal can still renew while its
+    session lives on the server."""
     c = claims(tkn)
     if not isinstance(c, dict):
         return False
     data = c.get("data") or {}
+    floor = time.time() - 86400 if expired_ok else time.time() + 60
     return (c.get("type") in (None, "", "login")
             and c.get("session_id") != "api-key"
-            and isinstance(c.get("exp"), (int, float)) and c["exp"] > time.time() + 60
+            and isinstance(c.get("exp"), (int, float)) and c["exp"] > floor
             and (not user_id or data.get("user_id") == user_id))
 
 
@@ -239,6 +242,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True, help="the portal, https://host")
     ap.add_argument("--user-id", default="", help="only accept tokens of this IsardVDI user")
+    ap.add_argument("--allow-expired", action="store_true",
+                    help="accept an expired token too (for renewing the browser's session)")
     args = ap.parse_args()
     host = urlparse(args.url).hostname
     if not host:
@@ -248,7 +253,7 @@ def main():
     for source in (firefox_tokens, chromium_tokens):
         try:
             for tkn in source(hosts):
-                if usable(tkn, args.user_id):
+                if usable(tkn, args.user_id, args.allow_expired):
                     uid = (claims(tkn).get("data") or {}).get("user_id")
                     if uid not in best or claims(tkn)["exp"] > claims(best[uid])["exp"]:
                         best[uid] = tkn

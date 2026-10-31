@@ -1443,6 +1443,56 @@ bastion_key() {
     echo "The bastion lets this key into your desktops and your deployments' desktops."
 }
 
+# ---- Web session: keep the portal logged in, in the browser ----------------------------------
+# The portal ends a web session that nobody renewed for a while (a closed tab, a computer asleep),
+# and the page then asks for a sign-in. Its page renews its token itself, even an expired one, as
+# long as the session still lives on the server. 'web keepalive' renews that session with the
+# browser's own token, so it stays alive: up to the portal's maximum session time, never beyond.
+# The new token it gets back is thrown away; the browser renews its own when it needs to.
+
+cmd_web() {
+    case "${1:-}" in
+        keepalive) shift; web_keepalive "$@" ;;
+        *) die "Usage: isardvdi web keepalive" ;;
+    esac
+}
+
+web_keepalive() {
+    # Exit status: 0 renewed; 3 no portal session in this computer's browsers; 4 the session has
+    # ended (sign in again in the browser); 75 no answer or a server error (try again later).
+    [[ $# -eq 0 ]] || die "Usage: isardvdi web keepalive"
+    load_config
+    local tkn rc=0 resp status body exp left
+    # The API key's account, if there is one: never renew someone else's session.
+    tkn=$(browser_portal_token "$(apikey_user_id)" 60 --allow-expired 2>/dev/null) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        err "No portal session in this computer's browsers: sign in to $URL in your browser."
+        exit 3
+    fi
+    resp=$(curl -sS -X POST -w '\n%{http_code}' --proto =https --connect-timeout 15 --max-time 60 \
+        -H @<(printf 'Authorization: Bearer %s\n' "$tkn") -H 'Content-Type: application/json' \
+        --data-binary '{}' "$URL/authentication/renew") || resp=$'\n000'
+    unset tkn
+    status="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    case "$status" in
+        200) ;;
+        401|403)
+            err "The web session has ended (its maximum time, or nothing renewed it in time): sign in
+again to $URL in your browser."
+            exit 4 ;;
+        000|5*) err "No answer from $URL (HTTP $status). Try again later."; exit 75 ;;
+        *) err "HTTP $status on POST /authentication/renew: $(sanitize "${body:0:200}")"; exit 1 ;;
+    esac
+    exp=$(jwt_exp "$(jq -r '.token // empty' <<< "$body" 2>/dev/null)")
+    if [[ "$exp" =~ ^[0-9]+$ ]]; then
+        left=$(( (exp - $(date +%s)) / 60 ))
+        echo "Web session renewed: valid until $(fmt_epoch "$exp") ($left min)."
+    else
+        echo "Web session renewed."
+    fi
+}
+
 # ---- Schedules: start deployments a few minutes before each class (systemd user timers) ------
 # Kept in $SCHED_FILE as [{name, slots: ["Tue 15:00"...], before: MIN, deployments: [{id, name}],
 # groups: [...], enabled}]. Each schedule gets a timer that runs 'isardvdi schedule run NAME'.
@@ -1971,13 +2021,14 @@ check_portal_token() {
 portal_user() { jwt_payload "$1" | jq -r "$JQ_CLEAN"' .data.name // .data.user_id // "?" | clean'; }
 
 browser_portal_token() {
-    # browser_portal_token [USER-ID [SECONDS]]. Stdout: the portal's login token, read from this
-    # computer's web browsers (lib/browser_token.py). Fails if no browser has a valid one (the
-    # portal only refreshes it while one of its tabs is open), or, without USER-ID, if several
-    # accounts are logged in (exit 3). SECONDS caps the time (keyring prompts included).
+    # browser_portal_token [USER-ID [SECONDS [--allow-expired]]]. Stdout: the portal's login
+    # token, read from this computer's web browsers (lib/browser_token.py). Fails if no browser
+    # has a valid one (the portal only refreshes it while one of its tabs is open), or, without
+    # USER-ID, if several accounts are logged in (exit 3). SECONDS caps the time (keyring prompts
+    # included). --allow-expired: an expired token too, which the portal can still renew.
     [[ -e "$BROWSER_HELPER" ]] || return 1
     check_helper "$BROWSER_HELPER"
-    timeout --foreground "${2:-300}" python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}"
+    timeout --foreground "${2:-300}" python3 -I "$BROWSER_HELPER" --url "$URL" --user-id "${1:-}" ${3:+"$3"}
 }
 
 apikey_user_id() { jwt_payload "$(secret_load apikey "$APIKEY_FILE" 2>/dev/null || true)" | jq -r '.data.user_id // empty'; }
@@ -2405,6 +2456,12 @@ COMMANDS
                                     then logs in with the desktop's stored password.
     bastion key [PUBLIC-KEY-FILE]   Show, or set, the SSH public key in your portal
                                     profile: the one the bastion lets in.
+    web keepalive                   Renew the portal session of this computer's web
+                                    browser, so the portal doesn't ask you to sign in
+                                    again after a while (up to the portal's maximum
+                                    session time, never beyond). The tray can run it
+                                    every few minutes. Exit status: 3 no session in the
+                                    browser, 4 the session has ended, 75 no answer.
     schedule [list]                 Your class schedules: when, what they start, next and
                                     last run.
     schedule add NAME --at "DAY HH:MM"... --deployment D... [--group G]... [--before MIN]
@@ -2576,6 +2633,7 @@ case "$cmd" in
     deployments|deps) cmd_deployments "$@" ;;
     deployment|dep)  cmd_deployment "$@" ;;
     bastion)         cmd_bastion "$@" ;;
+    web)             cmd_web "$@" ;;
     schedule|schedules|sched) cmd_schedule "$@" ;;
     students)        cmd_students "$@" ;;
     console)         cmd_console "$@" ;;
