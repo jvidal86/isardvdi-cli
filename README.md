@@ -61,6 +61,12 @@ isardvdi apikey create --from-browser   # key valid 90 days (--days N, at most 3
 isardvdi apikey status
 ```
 
+**On the phone:** `isardvdi apikey qr` shows the key as a QR code for the mIsardVDI app's *Scan QR
+code* button (needs `sudo apt install qrencode`). It is drawn on the terminal's alternate screen
+and wiped when you press Enter, so it stays in no scrollback; if the terminal is too small (about
+85x45) it opens in a small window instead (`--window` forces that). Anyone who sees the code has
+the key until it expires, so don't show it on a projector or a shared screen.
+
 **Two computers:** IsardVDI keeps one key per account, so creating a key on the second computer
 stops the first one's. Copy it instead: once `isardvdi web link` has set up the other computer (see
 "One web session on both computers"), `isardvdi apikey pull` fetches its key over SSH and checks it's
@@ -125,7 +131,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `web link HOST`, `web pull`, `web push`, `web extension` | One web session on both of your computers (see below) |
 | `web keepalive` | Renew your browser's portal session, so the portal doesn't ask you to sign in again (up to its maximum session time); the tray runs it every 10 min |
 | `console <desktop>` / `console <deployment> <student> [--browser\|--rdp] [--clipboard]` | Auto-start if needed, then open the console (SPICE by default) |
-| `apikey create [--from-browser] [--days N]` / `status` / `print` / `revoke` | Use an API key instead of SAML logins (see below) |
+| `apikey create [--from-browser] [--days N]` / `status` / `print` / `qr` / `revoke` | Use an API key instead of SAML logins (see below) |
 | `forget` | Delete every secret stored on this computer (before leaving a shared one) |
 | `media list`, `media status <name\|id>` | Your media and media shared with you, with download progress |
 | `media add <name> <https-url>` | Register an ISO/floppy; the server downloads the URL and the command waits for `Downloaded` |

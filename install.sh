@@ -58,6 +58,7 @@ main() {
     download "$BASE/lib/sso_login.py" "$tmp/sso_login.py"  || err "download failed: $BASE/lib/sso_login.py"
     download "$BASE/lib/browser_token.py" "$tmp/browser_token.py" || err "download failed: $BASE/lib/browser_token.py"
     download "$BASE/lib/secret_clipboard.py" "$tmp/secret_clipboard.py" || err "download failed: $BASE/lib/secret_clipboard.py"
+    download "$BASE/lib/secret_qr.py" "$tmp/secret_qr.py" || err "download failed: $BASE/lib/secret_qr.py"
     head -1 "$tmp/isardvdi" | grep -q '^#!' || err "downloaded file does not look like a script"
 
     mkdir -p "$BIN_DIR" "$DATA_DIR"
@@ -65,6 +66,7 @@ main() {
     install -m 0644 "$tmp/sso_login.py" "$DATA_DIR/sso_login.py"
     install -m 0644 "$tmp/browser_token.py" "$DATA_DIR/browser_token.py"
     install -m 0644 "$tmp/secret_clipboard.py" "$DATA_DIR/secret_clipboard.py"
+    install -m 0644 "$tmp/secret_qr.py" "$DATA_DIR/secret_qr.py"
     # The installed version, for 'isardvdi update' and 'isardvdi version'.
     case "$REF" in
         *[!0-9a-f]*) rm -f "$DATA_DIR/installed-commit" ;;
@@ -78,6 +80,7 @@ main() {
     for c in curl jq python3 ssh; do have "$c" || missing="$missing $c"; done
     [ -z "$missing" ] || info "missing tools:$missing  (e.g. sudo apt install curl jq python3 openssh-client)"
     info "optional: wireguard-tools (wg-quick) to reach desktops over the IsardVDI VPN"
+    info "optional: qrencode, for 'isardvdi apikey qr' (the API key to the phone app as a QR code)"
     have secret-tool || info "recommended: libsecret-tools (secret-tool) to keep the API key in the system keyring"
     python3 -c 'import cryptography' 2>/dev/null \
         || info "recommended: python3-cryptography, to renew the API key from Chrome/Chromium/Vivaldi/Brave/Edge"

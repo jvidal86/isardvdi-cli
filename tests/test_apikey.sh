@@ -82,5 +82,47 @@ check "no attempt outside the window"     '[[ ! -e "$T/BROWSER_CALLED" ]] && ! g
 cli apikey create --from-browser </dev/null >/dev/null 2>&1; rc=$?
 check "create without session/terminal refuses" '[[ $rc -ne 0 ]]'
 
+echo "== apikey qr (the key to the phone app)"
+qrkey=$(tok "{\"type\":\"external\",\"session_id\":\"api-key\",\"exp\":$((now+200*86400)),\"data\":{\"user_id\":\"$uid\",\"name\":\"$(printf 'x%.0s' {1..300})\"}}")
+printf '%s' "$qrkey" > "$APIKEY_FILE"
+cli apikey qr </dev/null >/dev/null 2>&1; rc=$?
+check "qr: refuses without a terminal"    '[[ $rc -ne 0 ]]'
+out=$(cli apikey qr --bogus 2>&1 </dev/null)
+check "qr: unknown option -> usage"       'grep -aq "Usage: isardvdi apikey qr" <<<"$out"'
+if command -v qrencode >/dev/null 2>&1; then
+    # qrencode wrapped: records how it was called and what it read, then runs the real one.
+    real_qr=$(command -v qrencode)
+    printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/qr-args"; tee -a "%s/qr-stdin" | "%s" "$@"\n' \
+        "$T" "$T" "$real_qr" > "$T/bin/qrencode"
+    chmod 755 "$T/bin/qrencode"
+    drive() { python3 -I "$REPO/tests/pty_drive.py" "$@"; }
+    run="PATH='$T/bin:$PATH' ISARDVDI_KEYRING=0 ISARDVDI_SSO_HELPER='$T/helpers/sso_login.py' '$REPO/bin/isardvdi' apikey qr; echo RC=\$?"
+    alt_on=$'\e[?1049h'; alt_off=$'\e[?1049l'
+
+    rm -f "$T/qr-args" "$T/qr-stdin"
+    out=$(drive 120 50 "$run" 'Show it now?|n\n')
+    check "qr: warns first; 'no' shows nothing" 'grep -aq "Anyone who sees" <<<"$out" && grep -aq "Not shown" <<<"$out" && [[ ! -e "$T/qr-stdin" ]]'
+
+    out=$(drive 120 50 "$run" 'Show it now?|y\n' 'press Enter|\n')
+    check "qr: drawn on the alternate screen, left on Enter" \
+        'grep -aqF "$alt_on" <<<"$out" && grep -aqF "$alt_off" <<<"$out" && grep -aq "QR code wiped" <<<"$out" && grep -aq "RC=0" <<<"$out"'
+    check "qr: QR blocks drawn"           'grep -aq "▀\|▄\|█" <<<"$out"'
+    check "qr: the key reaches qrencode on stdin only" '[[ "$(cat "$T/qr-stdin")" == "$qrkey" ]] && ! grep -aqF "$qrkey" "$T/qr-args"'
+    check "qr: the key itself is never printed" '! grep -aqF "$qrkey" <<<"$out"'
+
+    out=$(drive 80 24 "DISPLAY= WAYLAND_DISPLAY= $run" 'Show it now?|y\n')
+    check "qr: small terminal, no display -> says how big" \
+        'grep -aq "terminal is too small" <<<"$out" && grep -aq "RC=1" <<<"$out" && ! grep -aqF "$alt_on" <<<"$out"'
+
+    tok "{\"type\":\"external\",\"session_id\":\"api-key\",\"exp\":$((now-60)),\"data\":{\"user_id\":\"$uid\"}}" > "$APIKEY_FILE"
+    out=$(drive 120 50 "$run")
+    check "qr: an expired key is not shown" 'grep -aq "has expired" <<<"$out" && grep -aq "RC=1" <<<"$out"'
+    rm -f "$T/bin/qrencode" "$T/qr-args" "$T/qr-stdin"
+else
+    skip "apikey qr drawing (no qrencode)"
+fi
+check "qr: window helper installed by install.sh" 'grep -aq "secret_qr.py" "$REPO/install.sh"'
+check "qr: window helper refuses empty input" '! python3 -I "$REPO/lib/secret_qr.py" </dev/null'
+
 check "SAML sign-in never called"         '[[ ! -e "$T/SSO_CALLED" ]]'
 finish

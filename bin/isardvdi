@@ -10,6 +10,7 @@ PROFILE_DIR="$CONF_DIR/browser-profile"
 HELPER="${ISARDVDI_SSO_HELPER:-${XDG_DATA_HOME:-$HOME/.local/share}/isardvdi-cli/sso_login.py}"
 BROWSER_HELPER="$(dirname "$HELPER")/browser_token.py"
 CLIPBOARD_HELPER="$(dirname "$HELPER")/secret_clipboard.py"
+QR_HELPER="$(dirname "$HELPER")/secret_qr.py"
 TOKEN_FILE="$CONF_DIR/token"
 APIKEY_FILE="$CONF_DIR/apikey"
 VPN_FILE="$CONF_DIR/isard-vpn.conf"
@@ -2696,6 +2697,52 @@ cmd_apikey() {
             [[ ! -t 1 ]] || die "Refusing to print the key on the terminal; use it as \$(isardvdi apikey print)."
             secret_load apikey "$APIKEY_FILE" || die "The keyring can't be read now (locked, or no desktop session)."
             ;;
+        qr)
+            # The key as a QR code for the mIsardVDI phone app (its "Scan QR code" button), so
+            # nobody has to type or paste 500+ characters. Drawn on the terminal's alternate
+            # screen and wiped on Enter, so it stays in no scrollback; in a window if the terminal
+            # is too small. Never in a file, never on a command line.
+            [[ $# -eq 0 || "$1" == "--window" ]] || die "Usage: isardvdi apikey qr [--window]"
+            secret_exists apikey "$APIKEY_FILE" || die "No API key on this computer. Create one with: isardvdi apikey create --from-browser"
+            command -v qrencode >/dev/null 2>&1 || die "Needs qrencode. Install with: sudo apt install qrencode"
+            [[ -t 0 && -t 1 ]] || die "'apikey qr' shows the key on the screen; run it in a terminal."
+            apikey_expired && die "The API key has expired. Create a new one with: isardvdi apikey create --from-browser"
+            local key code cols rows width height
+            key=$(secret_load apikey "$APIKEY_FILE") || die "The keyring can't be read now (locked, or no desktop session)."
+            echo "Anyone who sees or photographs this QR code has your API key until $(fmt_epoch "$(apikey_exp)")"
+            echo "(it can't really be revoked). Don't show it on a projector or a shared screen."
+            read -rp "Show it now? [y/N] " code
+            [[ "$code" =~ ^[yYsS] ]] || { echo "Not shown."; return; }
+            code=$(printf '%s' "$key" | qrencode -t ANSIUTF8 -m 2 -l L) || die "qrencode failed."
+            # Here-strings, not pipes into head: an early-closing reader kills printf (pipefail).
+            width=$(sed 's/\x1b\[[0-9;]*m//g' <<< "${code%%$'\n'*}" | wc -m)
+            height=$(wc -l <<< "$code")
+            cols=$(tput cols 2>/dev/null || echo 80); rows=$(tput lines 2>/dev/null || echo 24)
+            if [[ "${1:-}" == "--window" ]] || (( width - 1 > cols || height + 2 > rows )); then
+                code=""
+                if [[ -e "$QR_HELPER" ]] && check_helper "$QR_HELPER" \
+                   && printf '%s' "$key" | qrencode -t PNG -s 8 -m 4 -l L -o - \
+                        | python3 -I "$QR_HELPER" --caption "Scan with mIsardVDI (Scan QR code), then press any key here"; then
+                    unset key
+                    echo "Closed."
+                    return
+                fi
+                unset key
+                [[ "${1:-}" == "--window" ]] && die "Can't open a window here (no desktop, or no PyQt6/PySide6/PyQt5)."
+                die "The terminal is too small for the QR code: it needs $((width - 1))x$((height + 2)), it is ${cols}x${rows}.
+Maximise it or make the font smaller (Ctrl+-), then run it again."
+            fi
+            unset key
+            # Alternate screen: what is drawn there is gone from the terminal once it is left.
+            trap 'tput rmcup 2>/dev/null; exit 130' INT TERM
+            tput smcup 2>/dev/null; tput clear 2>/dev/null
+            printf '%s\n' "$code"
+            code=""
+            read -rsp "Scan it with mIsardVDI (Scan QR code), then press Enter. " _
+            tput rmcup 2>/dev/null
+            trap - INT TERM
+            echo "QR code wiped from the screen."
+            ;;
         pull)
             # The same key as the other computer: IsardVDI keeps one key per account, so a key
             # created here would stop the other's. Over the SSH link of 'web link'.
@@ -2744,7 +2791,7 @@ cmd_apikey() {
             echo "Note: IsardVDI does not check keys against that record, so a copy of the key"
             echo "keeps working until it expires."
             ;;
-        *) die "Usage: isardvdi apikey [create [--from-browser] [--days N] | status | print | revoke]" ;;
+        *) die "Usage: isardvdi apikey [create [--from-browser] [--days N] | status | print | qr [--window] | revoke | pull]" ;;
     esac
 }
 
@@ -3177,6 +3224,10 @@ COMMANDS
     apikey status                   Show the local key's and the server's key expiry.
     apikey print                    Write the key to stdout, for scripts that call the API
                                     themselves: ISARD_KEY=\$(isardvdi apikey print)
+    apikey qr [--window]            Show the key as a QR code for the mIsardVDI phone app
+                                    (Scan QR code). On the terminal, wiped when you press
+                                    Enter; in a window if the terminal is too small (or
+                                    --window). Needs qrencode. Anyone who sees it has the key.
     apikey revoke                   Delete the local key and the server's record of it.
     apikey pull [--from [USER@]HOST]
                                     Copy the other computer's API key here, over the SSH
