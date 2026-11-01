@@ -3,6 +3,8 @@
 # pkexec and the server: nothing here touches a real tunnel or asks for a password.
 # shellcheck source=tests/common.sh
 source "$(dirname "$0")/common.sh"
+# Keep the server's MTU: on WSL the CLI writes 1280 instead, so every config would look changed.
+export ISARDVDI_VPN_MTU=0
 
 conf='[Interface]
 PrivateKey = cHJpdmF0ZQ==
