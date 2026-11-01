@@ -33,14 +33,25 @@ main() {
 
     if have curl; then
         download() { curl -fsSL -o "$2" "$1"; }
+        commit_of() { curl -fsS --max-time 15 -H 'Accept: application/vnd.github.sha' "$1"; }
     elif have wget; then
         download() { wget -qO "$2" "$1"; }
+        commit_of() { wget -qO- --timeout=15 --header='Accept: application/vnd.github.sha' "$1"; }
     else
         err "need curl or wget"
     fi
 
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT INT TERM
+
+    # Pin a branch or tag to its commit: every file then comes from the same version (raw
+    # GitHub caches a branch for minutes), and the commit is recorded for 'isardvdi update'.
+    case "$REF" in
+        *[!0-9a-f]*|"")
+            sha="$(commit_of "https://api.github.com/repos/$REPO/commits/$REF" 2>/dev/null)" || sha=""
+            case "$sha" in *[!0-9a-f]*) sha="" ;; esac
+            [ ${#sha} -ne 40 ] || { REF="$sha"; BASE="https://raw.githubusercontent.com/$REPO/$REF"; } ;;
+    esac
 
     info "downloading ($REF)"
     download "$BASE/bin/isardvdi"     "$tmp/isardvdi"      || err "download failed: $BASE/bin/isardvdi"
@@ -54,6 +65,12 @@ main() {
     install -m 0644 "$tmp/sso_login.py" "$DATA_DIR/sso_login.py"
     install -m 0644 "$tmp/browser_token.py" "$DATA_DIR/browser_token.py"
     install -m 0644 "$tmp/secret_clipboard.py" "$DATA_DIR/secret_clipboard.py"
+    # The installed version, for 'isardvdi update' and 'isardvdi version'.
+    case "$REF" in
+        *[!0-9a-f]*) rm -f "$DATA_DIR/installed-commit" ;;
+        *) if [ ${#REF} -eq 40 ]; then printf '%s\n' "$REF" > "$DATA_DIR/installed-commit"
+           else rm -f "$DATA_DIR/installed-commit"; fi ;;
+    esac
     info "installed $BIN_DIR/isardvdi and its helpers in $DATA_DIR"
 
     # Dependencies. Playwright (Python) drives the Microsoft SSO sign-in.
@@ -90,7 +107,7 @@ main() {
         *":$BIN_DIR:"*) ;;
         *) info "note: $BIN_DIR is not on your PATH" ;;
     esac
-    info "next: run 'isardvdi init'"
+    [ "${ISARDVDI_UPDATING:-0}" = 1 ] || info "next: run 'isardvdi init'"
 }
 
 main "$@"

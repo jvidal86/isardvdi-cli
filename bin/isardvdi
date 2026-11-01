@@ -17,6 +17,9 @@ RENEW_STAMP="$CONF_DIR/renew-attempt"
 VPN_ROUTES_FILE="$CONF_DIR/vpn-routes"   # the server's VPN routes, as accepted
 BASTION_HOST_FILE="$CONF_DIR/bastion-host"   # the bastion host:port, as accepted
 WEB_SESSION_FILE="$CONF_DIR/web-session"     # a web session pushed from your other computer
+UPDATE_STAMP="$CONF_DIR/update-check"        # when a newer version was last looked for
+GITHUB_REPO="jvidal86/isardvdi-cli"
+INSTALLED_COMMIT_FILE="$(dirname "$HELPER")/installed-commit"   # written by install.sh
 KEY_DAYS=90      # default API key lifetime (server maximum: 365)
 RENEW_DAYS=30    # renew automatically when the key has less than this left
 WARN_DAYS=14     # ... and warn when renewing keeps failing
@@ -2924,6 +2927,104 @@ cmd_forget() {
     echo "Kept $CONF_FILE (URL and account name only)."
 }
 
+# ---- Updating this program ---------------------------------------------------------------
+
+self_path() { readlink -f "$0" 2>/dev/null || printf '%s' "$0"; }
+
+self_git_dir() {
+    # Stdout: the git clone this program runs from (it updates with git pull); fails if none.
+    command -v git >/dev/null 2>&1 || return 1
+    git -C "$(dirname "$(self_path)")" rev-parse --show-toplevel 2>/dev/null
+}
+
+installed_commit() {
+    # Stdout: the commit this program is (from install.sh's record); fails if unknown.
+    local c
+    c=$(cat "$INSTALLED_COMMIT_FILE" 2>/dev/null) || return 1
+    [[ "$c" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s' "$c"
+}
+
+latest_commit() {
+    # latest_commit [SECONDS]. Stdout: the newest commit on GitHub's main branch.
+    local sha
+    sha=$(curl -fsS --max-time "${1:-15}" -H 'Accept: application/vnd.github.sha' \
+        "https://api.github.com/repos/$GITHUB_REPO/commits/main" 2>/dev/null) || return 1
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s' "$sha"
+}
+
+whats_new() {
+    # whats_new OLD NEW: the subject of each commit in between, newest last (at most 20).
+    local list
+    [[ -n "$1" ]] || return 0
+    list=$(curl -fsS --max-time 15 "https://api.github.com/repos/$GITHUB_REPO/compare/$1...$2" 2>/dev/null \
+        | jq -r "$JQ_CLEAN"'.commits // [] | .[-20:][] | .commit.message | split("\n")[0] | clean' 2>/dev/null) || return 0
+    [[ -n "$list" ]] || return 0
+    echo "What's new:"
+    printf '%s\n' "$list" | sed 's/^/  - /'
+}
+
+cmd_version() {
+    local top c
+    if top=$(self_git_dir); then
+        echo "isardvdi $(git -C "$top" rev-parse --short HEAD 2>/dev/null) (git clone: $top)"
+    elif c=$(installed_commit); then
+        echo "isardvdi ${c:0:7}"
+    else
+        echo "isardvdi (version not recorded: 'isardvdi update' installs the latest and records it)"
+    fi
+}
+
+cmd_update() {
+    # Installs the newest version from GitHub: in a git clone with git pull, else by running
+    # that version's install.sh, pinned to its commit, over this installation.
+    local check=0 top cur="" new tmp behind
+    case "${1:-}" in --check) check=1 ;; "") ;; *) die "Usage: isardvdi update [--check]" ;; esac
+    if top=$(self_git_dir); then
+        git -C "$top" fetch -q || die "git fetch failed in $top."
+        behind=$(git -C "$top" rev-list --count 'HEAD..@{u}' 2>/dev/null) || die "$top has no upstream branch: update it with git."
+        if [[ "$behind" == 0 ]]; then echo "isardvdi is up to date ($(git -C "$top" rev-parse --short HEAD))."; return 0; fi
+        echo "$behind newer commit(s) on $(git -C "$top" rev-parse --abbrev-ref '@{u}'):"
+        sanitize "$(git -C "$top" log --format='  - %s' 'HEAD..@{u}')"; echo
+        [[ $check -eq 0 ]] || { echo "Update with: isardvdi update"; return 0; }
+        git -C "$top" pull -q --ff-only || die "git pull failed in $top: update it there."
+        echo "Updated to $(git -C "$top" rev-parse --short HEAD)."
+        exit 0   # this file was replaced: read no more of it
+    fi
+    cur=$(installed_commit) || cur=""
+    new=$(latest_commit) || die "Couldn't ask GitHub for the latest version (no network?)."
+    if [[ "$cur" == "$new" ]]; then echo "isardvdi is up to date (${new:0:7})."; return 0; fi
+    if [[ -n "$cur" ]]; then echo "A newer isardvdi is available: ${cur:0:7} -> ${new:0:7}"
+    else echo "The latest isardvdi is ${new:0:7} (this one's version wasn't recorded)."; fi
+    whats_new "$cur" "$new"
+    [[ $check -eq 0 ]] || { echo "Update with: isardvdi update"; return 0; }
+    tmp=$(mktemp -d)
+    curl -fsSL --max-time 60 -o "$tmp/install.sh" "https://raw.githubusercontent.com/$GITHUB_REPO/$new/install.sh" \
+        || { rm -rf "$tmp"; die "Couldn't download the installer."; }
+    # Over this installation: this program's folder, and its helpers' (the installer records the commit).
+    ISARDVDI_REF="$new" BIN_DIR="$(dirname "$(self_path)")" DATA_DIR="$(dirname "$HELPER")" ISARDVDI_UPDATING=1 \
+        sh "$tmp/install.sh" || { rm -rf "$tmp"; die "The update failed; the installed version is unchanged or partly updated: run 'isardvdi update' again."; }
+    rm -rf "$tmp"
+    echo "Updated to ${new:0:7}."
+    exit 0   # this file was replaced: read no more of it
+}
+
+stderr_is_terminal() { [[ -t 2 ]]; }
+
+update_notice() {
+    # Once a day, in a terminal: say when GitHub has a newer version. Never installs anything.
+    stderr_is_terminal && [[ "${ISARDVDI_UPDATE_CHECK:-1}" != 0 ]] || return 0
+    [[ -z $(find "$UPDATE_STAMP" -mmin -1440 2>/dev/null) ]] || return 0
+    : > "$UPDATE_STAMP" 2>/dev/null || return 0
+    ! self_git_dir >/dev/null || return 0   # a clone: git says it
+    local cur new
+    cur=$(installed_commit) || cur=""
+    new=$(latest_commit 3) || return 0
+    [[ "$new" == "$cur" ]] || err "A newer isardvdi is available: run 'isardvdi update'."
+    return 0
+}
+
 cmd_help() {
     cat <<EOF
 isardvdi - CLI for managing IsardVDI virtual desktops via the REST API
@@ -3099,6 +3200,10 @@ COMMANDS
     template create <desktop> <template-name> [--group NAME|ID]... [--disabled]
                                     Make a template from a stopped desktop and share it with
                                     each --group (repeatable). The disk is copied as it is.
+    update [--check]                Install the newest version from GitHub (in a git clone:
+                                    git pull). --check only says whether there is one. In a
+                                    terminal, isardvdi also says so once a day.
+    version, --version              The installed version (its commit).
     forget                          Delete every secret stored on this computer (API key,
                                     token, VPN config, saved Microsoft sign-in). Use it
                                     before leaving a shared computer.
@@ -3118,6 +3223,7 @@ ENVIRONMENT
     ISARDVDI_KEYRING=0       Keep the API key and token in private files instead of the
                              system keyring (for WSL or servers without a desktop session;
                              without a running keyring this happens by itself).
+    ISARDVDI_UPDATE_CHECK    0: never look for a newer version (the daily notice).
     ISARDVDI_START_TIMEOUT   Seconds to wait for a desktop to start (or stop) in
                              start, ssh, console, rename --restart and
                              deployment --wait. Default: 180.
@@ -3185,8 +3291,8 @@ case "$cmd" in
         migrate_secrets
         # Not for 'vpn status' either: the tray asks it each time its menu opens.
         case "$cmd ${1:-}" in
-            "init "*|"login "*|"apikey "*|"api-key "*|"forget "*|"vpn status") ;;
-            *) apikey_auto_renew; apikey_expiry_warning ;;
+            "init "*|"login "*|"apikey "*|"api-key "*|"forget "*|"vpn status"|"update "*|"version "*|"--version "*) ;;
+            *) apikey_auto_renew; apikey_expiry_warning; update_notice || true ;;
         esac ;;
 esac
 case "$cmd" in
@@ -3217,6 +3323,8 @@ case "$cmd" in
     media)           cmd_media "$@" ;;
     template|templates) cmd_template "$@" ;;
     forget)          cmd_forget "$@" ;;
+    update|self-update|upgrade) cmd_update "$@" ;;
+    version|--version|-V) cmd_version ;;
     help|-h|--help)  cmd_help ;;
     *) err "Unknown command: $cmd"; cmd_help; exit 1 ;;
 esac

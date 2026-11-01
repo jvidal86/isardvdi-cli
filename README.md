@@ -28,6 +28,18 @@ Piping a script into `sh` runs whatever the URL serves at that moment. To check 
 `install.sh`, read it, and run it with `ISARDVDI_REF` set to a full commit hash, which can't be
 changed afterwards.
 
+### Updating
+
+```sh
+isardvdi update            # install the newest version (in a git clone: git pull)
+isardvdi update --check    # only say whether there is one, and what changed
+isardvdi version
+```
+
+`update` asks GitHub for the newest commit on `main` and runs that commit's `install.sh` over your
+installation (same folders). In a terminal, `isardvdi` also says once a day when a newer version
+exists; it never installs anything by itself (`ISARDVDI_UPDATE_CHECK=0` turns the notice off).
+
 ## First run
 
 ```sh
@@ -104,6 +116,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `vpn status [--json]`, `vpn up`, `vpn down` | The tunnel: wg-quick on the checked config (sudo, or the desktop's password prompt), or your NetworkManager connection |
 | `vpn config [--apply]` | Download the WireGuard config (same keys); `--apply` restarts a wg-quick tunnel if it changed |
 | `vpn reload` | Rotate keys and restart the tunnel (**breaks a working tunnel if misused**; refused for NetworkManager's) |
+| `update [--check]`, `version` | Update isardvdi itself from GitHub; show the installed version |
 | `deployments` | Deployments you own or co-own |
 | `students <deployment>` | A deployment's desktops: student, group, state, IP, id |
 | `deployment start\|stop\|extend <deployment>... [--group G]... [-y] [--wait] [--force]` | A whole class at once: every desktop of the deployments (or of a group), after asking |
