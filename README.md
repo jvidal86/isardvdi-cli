@@ -119,6 +119,7 @@ The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its brow
 | `rename <name\|id> <new-name> [--restart]` | Rename a desktop; `--restart` stops a running one first and starts it again |
 | `extend <desktop>` | Postpone a started desktop's automatic shutdown |
 | `ssh <desktop> [-l user] [--bastion] [--no-start] [-- ssh-args]` | Auto-start if needed, then SSH in (a student's desktop: through the bastion) |
+| `tunnel <desktop> [local:]port\|local:host:port... [-l user] [--bastion] [--no-start]` | Forward a desktop's ports to this computer's localhost (e.g. PostgreSQL for pgAdmin), over the VPN or the bastion, until Ctrl+C |
 | `vpn status [--json]`, `vpn up`, `vpn down` | The tunnel: wg-quick on the checked config (sudo, or the desktop's password prompt), or your NetworkManager connection |
 | `vpn config [--apply]` | Download the WireGuard config (same keys); `--apply` restarts a wg-quick tunnel if it changed |
 | `vpn reload` | Rotate keys and restart the tunnel (**breaks a working tunnel if misused**; refused for NetworkManager's) |
@@ -143,11 +144,23 @@ IsardVDI cannot take a file upload: `media add` needs a URL the server can downl
 a presigned link to an S3 bucket (`aws s3 presign s3://bucket/file.iso --expires-in 604800`).
 
 `<desktop>` is an exact UUID or a case-insensitive substring of the desktop name. `status`, `start`,
-`stop`, `extend`, `ssh` and `console` also take a student's desktop as `<deployment> <student>`:
+`stop`, `extend`, `ssh`, `tunnel` and `console` also take a student's desktop as `<deployment> <student>`:
 
 ```sh
 isardvdi start "ASIX.1" abdellah
 isardvdi ssh "ASIX.1" abdellah -- uptime   # a remote command goes after --
+```
+
+### Tunnels
+
+`tunnel` reaches a service on a desktop from a program on your computer, without opening it to
+the network: the port listens on `127.0.0.1` only, for as long as the command runs.
+
+```sh
+isardvdi tunnel athena 15432:5432          # pgAdmin/psql here -> localhost:15432
+isardvdi tunnel athena 8080 15432:5432     # several ports at once
+isardvdi tunnel athena 15433:172.18.0.2:5432   # a host as the desktop sees it (a container)
+isardvdi tunnel "ASIX.1" abdellah 13306:3306   # a student's desktop (through the bastion)
 ```
 
 ### Whole classes
