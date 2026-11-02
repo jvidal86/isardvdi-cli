@@ -501,6 +501,9 @@ resolve_target() {
         1) list=$(list_desktops_json) || exit 1
            if [[ "$1" =~ $UUID_RE ]]; then
                TARGET_ID="$1"
+               if ! jq -e --arg id "$1" 'any(.[]; .id == $id)' <<< "$list" >/dev/null; then
+                   bastion_alias "$1" "$list"
+               fi
            else
                TARGET_ID=$(pick_by_name desktop "$list" "$1" name "$UUID_RE") || exit 1
            fi ;;
@@ -513,6 +516,21 @@ resolve_target() {
     own=$(jq --arg id "$TARGET_ID" 'any(.[]; .id == $id)' <<< "$list") || exit 1
     [[ "$own" == true ]] && TARGET_OWN=1
     return 0
+}
+
+# bastion_alias ID LIST. An id that isn't one of your desktops may be a desktop's bastion SSH id
+# (the user of "ssh <id>@bastion...", in ~/.ssh/config): with it the server answers 403
+# not_enough_rights_desktop, which reads like a permissions problem. If it is one, use that
+# desktop's id instead (sets TARGET_ID) and say so. Best effort: any error leaves TARGET_ID as is.
+bastion_alias() {
+    local desktop name
+    desktop=$(api_get "/api/v4/items/bastions" 2>/dev/null \
+        | jq -r --arg id "$1" 'if type == "array" then (.[] | select(.id == $id) | .desktop_id // empty) else empty end' \
+            2>/dev/null | head -1) || return 0
+    [[ "$desktop" =~ $UUID_RE ]] || return 0
+    name=$(jq -r --arg id "$desktop" '.[] | select(.id == $id) | .name // ""' <<< "$2" 2>/dev/null) || name=""
+    err "$1 is the bastion SSH id of desktop \"$(sanitize "${name:-$desktop}")\"; using its desktop id $desktop."
+    TARGET_ID="$desktop"
 }
 
 # The target's current state and IP. Your own desktops come from your list; a student's from
