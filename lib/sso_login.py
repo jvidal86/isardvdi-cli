@@ -14,7 +14,18 @@ import re
 import sys
 import time
 
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sys.exit(
+        "isardvdi: the Microsoft sign-in needs the Python package 'playwright' and its Chromium, "
+        "which are not installed (apt doesn't have them).\n"
+        "Install them for your user:\n"
+        "    python3 -m pip install --user --break-system-packages playwright   "
+        "(on Ubuntu 22.04 / older pip: drop --break-system-packages)\n"
+        "    python3 -m playwright install chromium\n"
+        "    python3 -m playwright install-deps chromium   (only if the browser fails to start; asks for sudo)"
+    )
 
 JWT = re.compile(r"^[\w-]+\.[\w-]+\.[\w-]*$")
 

@@ -11,17 +11,34 @@ but any IsardVDI URL works.
 curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.sh | sh
 ```
 
-Installs `~/.local/bin/isardvdi` and its helpers in `~/.local/share/isardvdi-cli/` (no sudo). To also
-install the Python dependency (Playwright + Chromium) in the same step:
+Installs `~/.local/bin/isardvdi` and its helpers in `~/.local/share/isardvdi-cli/` (the program needs
+no sudo). It then **checks everything isardvdi needs and offers to install what is missing**, asking
+before each step:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.sh | ISARDVDI_INSTALL_DEPS=1 sh
+```
+isardvdi-install: checking what isardvdi needs ('required' = ...):
+  ok       curl - talks to the IsardVDI API
+  missing (recommended) libsecret-tools - keeps the API key in the system keyring
+  MISSING (required)    Python 'playwright' + Chromium - the Microsoft sign-in; ...
+isardvdi-install: Install with sudo: apt-get install libsecret-tools python3-cryptography ? [Y/n]
+isardvdi-install: Install Playwright + Chromium for your user (pip, ~150 MB ...)? [Y/n]
 ```
 
-Requirements: `curl`, `jq`, `python3`, `ssh`, Python `playwright` (+ Chromium), and `wireguard-tools`
-if you want to reach desktops over the VPN. Recommended: `libsecret-tools` (keeps the API key in the
-system keyring) and `python3-cryptography` (renews the key from Chromium-based browsers). For `console`: `virt-viewer` (SPICE, the default) and,
-for `--rdp`, `freerdp3-x11` (or Remmina).
+| | What | Installed how |
+|---|---|---|
+| required | `curl`, `jq`, `python3`, `ssh` (openssh-client) | `sudo apt-get install` |
+| required for sign-in | Python `playwright` + its Chromium (not in apt) | `pip --user` + `playwright install chromium`, then Chromium's system libraries with sudo |
+| recommended | `libsecret-tools` (keyring), `python3-cryptography`, `wireguard-tools` (VPN), `virt-viewer` (console) | `sudo apt-get install` |
+| optional | `qrencode`, `python3-pyqt5` (clipboard/QR windows), `freerdp3-x11` (`console --rdp`) | only with `ISARDVDI_INSTALL_DEPS=all` |
+
+Automatic apt installs need a Debian/Ubuntu system with `sudo`; elsewhere the installer prints the
+package names. Without a terminal to ask on, nothing is installed and the commands are printed.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.sh | ISARDVDI_INSTALL_DEPS=1 sh    # install it all, no questions
+curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.sh | ISARDVDI_INSTALL_DEPS=all sh  # ... plus the optional ones
+curl -fsSL https://raw.githubusercontent.com/jvidal86/isardvdi-cli/main/install.sh | ISARDVDI_INSTALL_DEPS=0 sh    # only report what is missing
+```
 
 Pin a version with `ISARDVDI_REF=<tag-or-commit>`; change locations with `BIN_DIR` / `DATA_DIR`.
 Piping a script into `sh` runs whatever the URL serves at that moment. To check first, download

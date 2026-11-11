@@ -37,6 +37,19 @@ check "an exact commit is recorded as is" \
 check "an update doesn't say 'next: run init'" \
     'printf %s "$NEW" > "$T/api-sha"; ISARDVDI_UPDATING=1 install_cli && ! grep -q "next: run" "$T/inst.out"'
 
+echo "== install.sh checks its requirements and never installs without being allowed"
+# Fake sudo/apt-get/pip log instead of acting; with no terminal (as here) nothing may call them.
+for f in sudo apt-get; do printf '#!/bin/sh\necho "%s $*" >> "%s/deps.log"\n' "$f" "$T" > "$T/gh/$f"; chmod 755 "$T/gh/$f"; done
+printf '%s' "$NEW" > "$T/api-sha"; : > "$T/deps.log"
+check "it lists what it checked" 'install_cli && grep -q "checking what isardvdi needs" "$T/inst.out" && grep -q " curl - " "$T/inst.out"'
+check "no terminal, no variable: nothing is installed" '[[ ! -s "$T/deps.log" ]]'
+check "ISARDVDI_INSTALL_DEPS=0: report only, nothing installed" \
+    'ISARDVDI_INSTALL_DEPS=0 install_cli && [[ ! -s "$T/deps.log" ]]'
+check "an update doesn't list or install anything" \
+    'ISARDVDI_UPDATING=1 install_cli && ! grep -q "checking what isardvdi needs" "$T/inst.out" && [[ ! -s "$T/deps.log" ]]'
+check "install.sh is valid POSIX sh (dash)" '! command -v dash >/dev/null || dash -n "$REPO/install.sh"'
+rm -f "$T/gh/sudo" "$T/gh/apt-get"
+
 echo "== isardvdi update (an installed copy)"
 real_self_git_dir=$(declare -f self_git_dir)
 HELPER="$T/share/sso_login.py"; INSTALLED_COMMIT_FILE="$T/share/installed-commit"; mkdir -p "$T/share"
