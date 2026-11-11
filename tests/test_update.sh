@@ -48,6 +48,26 @@ check "ISARDVDI_INSTALL_DEPS=0: report only, nothing installed" \
 check "an update doesn't list or install anything" \
     'ISARDVDI_UPDATING=1 install_cli && ! grep -q "checking what isardvdi needs" "$T/inst.out" && [[ ! -s "$T/deps.log" ]]'
 check "install.sh is valid POSIX sh (dash)" '! command -v dash >/dev/null || dash -n "$REPO/install.sh"'
+# Chromium's libraries: root runs apt-get on validated names only, never Python. The fake python3
+# answers the dry run with good names and hostile lines (an option, a command, a bad indent).
+cat > "$T/gh/python3" <<FAKE
+#!/bin/sh
+case "\$*" in
+    *"-m pip install --help"*) exit 0 ;;
+    *"-m pip install"*|*"-m playwright install chromium"*) exit 0 ;;
+    *"-m playwright install-deps --dry-run chromium"*)
+        printf 'Missing system dependencies (4):\n  libgbm1\n  -oProxyCommand=evil\n  xvfb\n  rm;touch PWNED\n   indented\nUPPER\n'; exit 0 ;;
+    *"import playwright"*) exit 1 ;;
+esac
+exec $(command -v python3) "\$@"
+FAKE
+chmod 755 "$T/gh/python3"
+: > "$T/deps.log"
+check "Chromium libraries: apt-get gets only valid package names" \
+    'ISARDVDI_INSTALL_DEPS=1 install_cli; grep -q "^sudo apt-get install -y --no-install-recommends libgbm1 xvfb\$" "$T/deps.log" \
+     && ! grep -qE "oProxyCommand|PWNED|UPPER|indented" "$T/deps.log"'
+check "root never runs Python (no sudo python3, no PYTHONPATH)" '! grep -qE "python3( |\$)|PYTHONPATH|install-deps" "$T/deps.log" && [[ ! -e "$T/inst/PWNED" ]]'
+rm -f "$T/gh/python3"
 rm -f "$T/gh/sudo" "$T/gh/apt-get"
 
 echo "== isardvdi update (an installed copy)"

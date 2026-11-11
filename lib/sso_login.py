@@ -24,7 +24,8 @@ except ImportError:
         "    python3 -m pip install --user --break-system-packages playwright   "
         "(on Ubuntu 22.04 / older pip: drop --break-system-packages)\n"
         "    python3 -m playwright install chromium\n"
-        "    python3 -m playwright install-deps chromium   (only if the browser fails to start; asks for sudo)"
+        "    python3 -m playwright install-deps --dry-run chromium   "
+        "(only if the browser fails to start: lists the system packages to sudo apt-get install)"
     )
 
 JWT = re.compile(r"^[\w-]+\.[\w-]+\.[\w-]*$")

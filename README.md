@@ -27,7 +27,7 @@ isardvdi-install: Install Playwright + Chromium for your user (pip, ~150 MB ...)
 | | What | Installed how |
 |---|---|---|
 | required | `curl`, `jq`, `python3`, `ssh` (openssh-client) | `sudo apt-get install` |
-| required for sign-in | Python `playwright` + its Chromium (not in apt) | `pip --user` + `playwright install chromium`, then Chromium's system libraries with sudo |
+| required for sign-in | Python `playwright` + its Chromium (not in apt) | `pip --user` + `playwright install chromium`, then Chromium's system libraries with `sudo apt-get` |
 | recommended | `libsecret-tools` (keyring), `python3-cryptography`, `wireguard-tools` (VPN), `virt-viewer` (console) | `sudo apt-get install` |
 | optional | `qrencode`, `python3-pyqt5` (clipboard/QR windows), `freerdp3-x11` (`console --rdp`) | only with `ISARDVDI_INSTALL_DEPS=all` |
 
@@ -123,7 +123,8 @@ differences:
   portal and run `isardvdi apikey create --from-browser`, then paste.
 
 The Microsoft sign-in (`init`, `login`) needs WSLg (Windows 11) to show its browser window, and
-`python3 -m playwright install-deps chromium` (it asks for sudo) once on a fresh Ubuntu.
+Chromium's system libraries once on a fresh Ubuntu (the installer offers this: it lists them with
+`python3 -m playwright install-deps --dry-run chromium` and installs only those packages with `sudo apt-get`).
 
 ## Commands
 

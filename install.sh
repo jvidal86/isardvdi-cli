@@ -153,6 +153,7 @@ DEPS_EOF
         info "  ok       playwright + Chromium - the Microsoft sign-in"
     fi
 
+    LIBS_HINT="List them with 'python3 -m playwright install-deps --dry-run chromium', then: sudo apt-get install <those packages>"
     pip_flags="--user"
     python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages \
         && pip_flags="--user --break-system-packages"   # pip >= 23 (Ubuntu 24.04) needs it; older pip doesn't know it
@@ -200,7 +201,7 @@ DEPS_EOF
         if [ "$NEED_PW" = 1 ] || [ "$NEED_CHROMIUM" = 1 ]; then
             if ! have python3; then
                 info "python3 is still missing: install it, then run this installer again for Playwright."
-            elif [ -n "$MODE" ] || ask "Install Playwright + Chromium for your user (pip, ~150 MB in $pw_dir; then Chromium's system libraries with sudo)?"; then
+            elif [ -n "$MODE" ] || ask "Install Playwright + Chromium for your user (pip, ~150 MB in $pw_dir; then its system libraries with sudo apt-get)?"; then
                 pw_fail=0
                 if [ "$NEED_PW" = 1 ]; then
                     info "running: python3 -m pip install $pip_flags playwright"
@@ -212,10 +213,22 @@ DEPS_EOF
                     python3 -m playwright install chromium </dev/null || pw_fail=1
                 fi
                 if [ "$pw_fail" = 0 ] && have apt-get; then
-                    info "running: sudo python3 -m playwright install-deps chromium  (Chromium's system libraries)"
-                    as_root env "PYTHONPATH=$(python3 -m site --user-site 2>/dev/null)" \
-                        python3 -m playwright install-deps chromium </dev/null \
-                        || info "WARNING: install-deps failed. If the sign-in browser won't start, run:  sudo python3 -m playwright install-deps chromium"
+                    # Chromium's system libraries. Playwright lists the missing ones (a dry run, as
+                    # you); only names shaped like Debian packages reach sudo, and sudo runs apt-get
+                    # alone: Python never runs as root, so nothing in your user folders can get there.
+                    libs=$(python3 -m playwright install-deps --dry-run chromium </dev/null 2>/dev/null \
+                        | sed -n 's/^  \([a-z0-9][a-z0-9.+-]*\)$/\1/p' | tr '\n' ' ')
+                    # shellcheck disable=SC2086  # a list of words
+                    set -- $libs
+                    if [ $# -eq 0 ]; then
+                        info "no extra system libraries for Chromium to install (if the sign-in browser won't start: $LIBS_HINT)"
+                    elif [ $# -gt 200 ]; then
+                        info "WARNING: Playwright listed an unexpected number of libraries; not installing them. $LIBS_HINT"
+                    else
+                        info "running: sudo apt-get install $*  (Chromium's system libraries)"
+                        as_root apt-get install -y --no-install-recommends "$@" </dev/null \
+                            || info "WARNING: couldn't install Chromium's libraries. $LIBS_HINT"
+                    fi
                 fi
                 [ "$pw_fail" = 0 ] || info "WARNING: Playwright's installation failed. Run:  python3 -m pip install $pip_flags playwright && python3 -m playwright install chromium"
             else
